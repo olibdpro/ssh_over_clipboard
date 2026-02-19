@@ -58,6 +58,16 @@ sshc localhost --clipboard-backend auto --clipboard-read-timeout 2 --clipboard-w
 sshcd --clipboard-backend auto --clipboard-read-timeout 2 --clipboard-write-timeout 2
 ```
 
+You can tune startup probing separately from runtime polling/writes:
+
+```bash
+sshc localhost \
+  --clipboard-read-timeout 0.25 \
+  --clipboard-write-timeout 1.0 \
+  --clipboard-probe-read-timeout 2.0 \
+  --clipboard-probe-write-timeout 2.0
+```
+
 `--clipboard-backend` choices: `auto`, `wayland`, `xclip`, `xsel`.
 In `auto` mode, session detection is used:
 - Wayland session: `wl-copy`/`wl-paste` only.

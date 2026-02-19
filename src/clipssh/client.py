@@ -19,7 +19,7 @@ class ClientConfig:
     poll_interval: float = 0.1
     connect_timeout: float = 10.0
     session_timeout: float = 300.0
-    retry_interval: float = 0.5
+    retry_interval: float = 0.2
     verbose: bool = False
 
 
@@ -63,12 +63,27 @@ class ClipboardSSHClient:
             return None
         return decode_message(text)
 
+    def _read_message_with_stats(self) -> tuple[Message | None, bool]:
+        try:
+            text = self.backend.read_text()
+        except ClipboardError as exc:
+            self._log(f"clipboard read failed: {exc}")
+            return None, False
+
+        message = decode_message(text)
+        if message is None and bool(text):
+            return None, True
+        return message, False
+
     def _write_message(self, message: Message) -> None:
         payload = encode_message(message)
         try:
             self.backend.write_text(payload)
         except ClipboardError as exc:
             raise RuntimeError(f"Failed to write clipboard message: {exc}") from exc
+
+    def _poll_sleep(self) -> None:
+        time.sleep(self.config.poll_interval)
 
     def _update_prompt_context(self, body: dict[str, Any]) -> None:
         prompt = body.get("prompt")
@@ -116,6 +131,9 @@ class ClipboardSSHClient:
 
         deadline = time.monotonic() + self.config.connect_timeout
         next_send = 0.0
+        connect_start = time.monotonic()
+        read_attempts = 0
+        ignored_non_protocol = 0
 
         while time.monotonic() < deadline:
             now = time.monotonic()
@@ -124,39 +142,45 @@ class ClipboardSSHClient:
                 next_send = now + self.config.retry_interval
                 self._log(f"sent connect_req for session {session_id}")
 
-            incoming = self._read_message()
-            if incoming is None:
-                time.sleep(self.config.poll_interval)
-                continue
+            incoming, was_non_protocol = self._read_message_with_stats()
+            read_attempts += 1
+            if was_non_protocol:
+                ignored_non_protocol += 1
 
-            if incoming.target != "client" or incoming.source != "server":
-                time.sleep(self.config.poll_interval)
-                continue
+            if incoming is not None:
+                if incoming.target != "client" or incoming.source != "server":
+                    pass
+                elif incoming.session_id != session_id:
+                    pass
+                elif not state.incoming_seen.mark(incoming.msg_id):
+                    pass
+                elif incoming.kind == "connect_ack":
+                    body = incoming.body if isinstance(incoming.body, dict) else {}
+                    self._update_prompt_context(body)
+                    self._state = state
+                    elapsed = time.monotonic() - connect_start
+                    self._log(
+                        f"connected with session {session_id} in {elapsed:.3f}s "
+                        f"(reads={read_attempts}, ignored_non_protocol={ignored_non_protocol})"
+                    )
+                    return
+                elif incoming.kind == "busy":
+                    raise RuntimeError("Server is busy with another active session")
+                elif incoming.kind == "error":
+                    message = (
+                        incoming.body.get("error")
+                        if isinstance(incoming.body, dict)
+                        else "unknown error"
+                    )
+                    raise RuntimeError(f"Server rejected connection: {message}")
 
-            if incoming.session_id != session_id:
-                time.sleep(self.config.poll_interval)
-                continue
+            self._poll_sleep()
 
-            if not state.incoming_seen.mark(incoming.msg_id):
-                time.sleep(self.config.poll_interval)
-                continue
-
-            if incoming.kind == "connect_ack":
-                body = incoming.body if isinstance(incoming.body, dict) else {}
-                self._update_prompt_context(body)
-                self._state = state
-                self._log(f"connected with session {session_id}")
-                return
-
-            if incoming.kind == "busy":
-                raise RuntimeError("Server is busy with another active session")
-
-            if incoming.kind == "error":
-                message = incoming.body.get("error") if isinstance(incoming.body, dict) else "unknown error"
-                raise RuntimeError(f"Server rejected connection: {message}")
-
-            time.sleep(self.config.poll_interval)
-
+        elapsed = time.monotonic() - connect_start
+        self._log(
+            f"connect timeout after {elapsed:.3f}s "
+            f"(reads={read_attempts}, ignored_non_protocol={ignored_non_protocol})"
+        )
         raise TimeoutError("Timed out waiting for server connect_ack")
 
     def execute(
@@ -191,63 +215,59 @@ class ClipboardSSHClient:
                 next_send = now + self.config.retry_interval
 
             incoming = self._read_message()
+            sleep_needed = True
             if incoming is not None:
                 if incoming.target != "client" or incoming.source != "server":
-                    time.sleep(self.config.poll_interval)
-                    continue
-                if incoming.session_id != state.session_id:
-                    time.sleep(self.config.poll_interval)
-                    continue
-                if not state.incoming_seen.mark(incoming.msg_id):
-                    time.sleep(self.config.poll_interval)
-                    continue
+                    pass
+                elif incoming.session_id != state.session_id:
+                    pass
+                elif not state.incoming_seen.mark(incoming.msg_id):
+                    pass
+                else:
+                    body = incoming.body if isinstance(incoming.body, dict) else {}
 
-                body = incoming.body if isinstance(incoming.body, dict) else {}
-
-                if incoming.kind in {"stdout", "stderr", "exit"} and body.get("cmd_id") != cmd_id:
-                    time.sleep(self.config.poll_interval)
-                    continue
-
-                if incoming.kind == "stdout":
-                    chunk = body.get("data", "")
-                    if isinstance(chunk, str):
-                        stdout_parts.append(chunk)
-                        if on_stdout is not None:
-                            on_stdout(chunk)
-                    last_activity = now
-
-                elif incoming.kind == "stderr":
-                    chunk = body.get("data", "")
-                    if isinstance(chunk, str):
-                        stderr_parts.append(chunk)
-                        if on_stderr is not None:
-                            on_stderr(chunk)
-                    last_activity = now
-
-                elif incoming.kind == "exit":
-                    self._update_prompt_context(body)
-                    code_raw = body.get("exit_code", 1)
-                    try:
-                        exit_code = int(code_raw)
-                    except (TypeError, ValueError):
-                        exit_code = 1
-                    return CommandResult(
-                        stdout="".join(stdout_parts),
-                        stderr="".join(stderr_parts),
-                        exit_code=exit_code,
-                        prompt_user=self._prompt_user,
-                        prompt_cwd=self._prompt_cwd,
-                        prompt_host=self._prompt_host,
-                    )
-
-                elif incoming.kind == "error":
-                    message = body.get("error", "unknown server error")
-                    raise RuntimeError(str(message))
+                    if incoming.kind in {"stdout", "stderr", "exit"} and body.get("cmd_id") != cmd_id:
+                        pass
+                    elif incoming.kind == "stdout":
+                        chunk = body.get("data", "")
+                        if isinstance(chunk, str):
+                            stdout_parts.append(chunk)
+                            if on_stdout is not None:
+                                on_stdout(chunk)
+                        last_activity = now
+                        sleep_needed = False
+                    elif incoming.kind == "stderr":
+                        chunk = body.get("data", "")
+                        if isinstance(chunk, str):
+                            stderr_parts.append(chunk)
+                            if on_stderr is not None:
+                                on_stderr(chunk)
+                        last_activity = now
+                        sleep_needed = False
+                    elif incoming.kind == "exit":
+                        self._update_prompt_context(body)
+                        code_raw = body.get("exit_code", 1)
+                        try:
+                            exit_code = int(code_raw)
+                        except (TypeError, ValueError):
+                            exit_code = 1
+                        return CommandResult(
+                            stdout="".join(stdout_parts),
+                            stderr="".join(stderr_parts),
+                            exit_code=exit_code,
+                            prompt_user=self._prompt_user,
+                            prompt_cwd=self._prompt_cwd,
+                            prompt_host=self._prompt_host,
+                        )
+                    elif incoming.kind == "error":
+                        message = body.get("error", "unknown server error")
+                        raise RuntimeError(str(message))
 
             if now - last_activity > self.config.session_timeout:
                 raise TimeoutError("Timed out waiting for command response")
 
-            time.sleep(self.config.poll_interval)
+            if sleep_needed:
+                self._poll_sleep()
 
     def disconnect(self) -> None:
         if self._state is None:
@@ -328,14 +348,26 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--clipboard-read-timeout",
         type=float,
-        default=2.0,
-        help="Clipboard read command timeout in seconds",
+        default=0.25,
+        help="Clipboard read command timeout in seconds (runtime polling)",
     )
     parser.add_argument(
         "--clipboard-write-timeout",
         type=float,
+        default=1.0,
+        help="Clipboard write command timeout in seconds (runtime writes)",
+    )
+    parser.add_argument(
+        "--clipboard-probe-read-timeout",
+        type=float,
         default=2.0,
-        help="Clipboard write command timeout in seconds",
+        help="Clipboard read command timeout in seconds for startup backend probe",
+    )
+    parser.add_argument(
+        "--clipboard-probe-write-timeout",
+        type=float,
+        default=2.0,
+        help="Clipboard write command timeout in seconds for startup backend probe",
     )
     parser.add_argument(
         "--poll-interval-ms",
@@ -358,7 +390,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--retry-interval",
         type=float,
-        default=0.5,
+        default=0.2,
         help="Seconds between retransmitting connect/cmd requests",
     )
     return parser
@@ -372,8 +404,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         backend = detect_backend(
             backend_preference=args.clipboard_backend,
-            read_timeout=max(args.clipboard_read_timeout, 0.1),
+            read_timeout=max(args.clipboard_read_timeout, 0.05),
             write_timeout=max(args.clipboard_write_timeout, 0.1),
+            probe_read_timeout=max(args.clipboard_probe_read_timeout, 0.1),
+            probe_write_timeout=max(args.clipboard_probe_write_timeout, 0.1),
         )
     except ClipboardError as exc:
         print(f"sshc: {exc}", file=sys.stderr)

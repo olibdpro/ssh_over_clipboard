@@ -22,6 +22,7 @@ class ServerConfig:
     max_output_chunk: int = 32768
     preferred_shell: str = "tcsh"
     command_timeout: float = 120.0
+    inter_frame_delay: float = 0.01
     verbose: bool = False
 
 
@@ -38,6 +39,8 @@ class ClipboardSSHServer:
         self.config = config
         self._active: ActiveSession | None = None
         self._server_seq = 0
+        self._read_attempts = 0
+        self._ignored_non_protocol = 0
 
     def _log(self, text: str) -> None:
         if self.config.verbose:
@@ -47,24 +50,26 @@ class ClipboardSSHServer:
         self._server_seq += 1
         return self._server_seq
 
-    def _read_message(self) -> Message | None:
+    def _read_message_with_stats(self) -> tuple[Message | None, bool]:
         try:
             text = self.backend.read_text()
         except ClipboardError as exc:
             self._log(f"clipboard read failed: {exc}")
-            return None
-        return decode_message(text)
+            return None, False
 
-    def _write_message(self, message: Message) -> None:
+        message = decode_message(text)
+        if message is None and bool(text):
+            return None, True
+        return message, False
+
+    def _write_message(self, message: Message) -> bool:
         payload = encode_message(message)
         try:
             self.backend.write_text(payload)
         except ClipboardError as exc:
             self._log(f"clipboard write failed: {exc}")
-            return
-
-        # Give the peer a chance to observe this frame before writing the next one.
-        time.sleep(max(self.config.poll_interval * 2.0, 0.02))
+            return False
+        return True
 
     def _make_message(self, *, kind: str, session_id: str, body: Any = None) -> Message:
         return build_message(
@@ -112,6 +117,11 @@ class ClipboardSSHServer:
         self._active = None
 
     def _handle_connect(self, message: Message) -> None:
+        started = time.monotonic()
+        self._log(
+            f"received connect_req for session {message.session_id} "
+            f"(reads={self._read_attempts}, ignored_non_protocol={self._ignored_non_protocol})"
+        )
         if self._active is not None:
             if message.session_id == self._active.state.session_id:
                 self._log(f"re-acknowledging session {message.session_id}")
@@ -123,6 +133,8 @@ class ClipboardSSHServer:
                         body={"backend": self.backend.name(), "prompt": prompt_context},
                     )
                 )
+                elapsed = time.monotonic() - started
+                self._log(f"sent connect_ack for existing session {message.session_id} in {elapsed:.3f}s")
                 return
 
             self._log(f"rejecting session {message.session_id}: busy")
@@ -160,10 +172,19 @@ class ClipboardSSHServer:
                 body={"shell": shell_path, "backend": self.backend.name(), "prompt": prompt_context},
             )
         )
+        elapsed = time.monotonic() - started
+        self._log(f"sent connect_ack for session {message.session_id} in {elapsed:.3f}s")
 
     def _emit_command_messages(self, outgoing: list[Message]) -> None:
-        for frame in outgoing:
-            self._write_message(frame)
+        last_idx = len(outgoing) - 1
+        for idx, frame in enumerate(outgoing):
+            wrote = self._write_message(frame)
+            if (
+                wrote
+                and idx < last_idx
+                and self.config.inter_frame_delay > 0
+            ):
+                time.sleep(self.config.inter_frame_delay)
 
     def _handle_command(self, message: Message, is_new: bool) -> None:
         if self._active is None:
@@ -275,7 +296,10 @@ class ClipboardSSHServer:
                 if stop_event is not None and stop_event.is_set():
                     return
 
-                message = self._read_message()
+                message, was_non_protocol = self._read_message_with_stats()
+                self._read_attempts += 1
+                if was_non_protocol:
+                    self._ignored_non_protocol += 1
                 if message is not None:
                     self._handle_message(message)
 
@@ -297,14 +321,26 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--clipboard-read-timeout",
         type=float,
-        default=2.0,
-        help="Clipboard read command timeout in seconds",
+        default=0.25,
+        help="Clipboard read command timeout in seconds (runtime polling)",
     )
     parser.add_argument(
         "--clipboard-write-timeout",
         type=float,
+        default=1.0,
+        help="Clipboard write command timeout in seconds (runtime writes)",
+    )
+    parser.add_argument(
+        "--clipboard-probe-read-timeout",
+        type=float,
         default=2.0,
-        help="Clipboard write command timeout in seconds",
+        help="Clipboard read command timeout in seconds for startup backend probe",
+    )
+    parser.add_argument(
+        "--clipboard-probe-write-timeout",
+        type=float,
+        default=2.0,
+        help="Clipboard write command timeout in seconds for startup backend probe",
     )
     parser.add_argument(
         "--shell",
@@ -340,8 +376,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         backend = detect_backend(
             backend_preference=args.clipboard_backend,
-            read_timeout=max(args.clipboard_read_timeout, 0.1),
+            read_timeout=max(args.clipboard_read_timeout, 0.05),
             write_timeout=max(args.clipboard_write_timeout, 0.1),
+            probe_read_timeout=max(args.clipboard_probe_read_timeout, 0.1),
+            probe_write_timeout=max(args.clipboard_probe_write_timeout, 0.1),
         )
     except ClipboardError as exc:
         print(f"sshcd: {exc}", file=sys.stderr)

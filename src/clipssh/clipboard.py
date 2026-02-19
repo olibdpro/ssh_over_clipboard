@@ -36,18 +36,20 @@ class CommandClipboardBackend:
     backend_name: str
     read_timeout: float = 2.0
     write_timeout: float = 5.0
+    probe_read_timeout: float = 2.0
+    probe_write_timeout: float = 2.0
 
     def name(self) -> str:
         return self.backend_name
 
-    def read_text(self) -> str | None:
+    def _read_text_with_timeout(self, timeout: float) -> str | None:
         try:
             result = subprocess.run(
                 self.read_cmd,
                 capture_output=True,
                 text=True,
                 check=False,
-                timeout=self.read_timeout,
+                timeout=timeout,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ClipboardError(f"Clipboard read failed for {self.backend_name}: {exc}") from exc
@@ -59,7 +61,7 @@ class CommandClipboardBackend:
             )
         return result.stdout
 
-    def write_text(self, text: str) -> None:
+    def _write_text_with_timeout(self, text: str, timeout: float) -> None:
         try:
             subprocess.run(
                 self.write_cmd,
@@ -67,10 +69,20 @@ class CommandClipboardBackend:
                 text=True,
                 capture_output=True,
                 check=True,
-                timeout=self.write_timeout,
+                timeout=timeout,
             )
         except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             raise ClipboardError(f"Clipboard write failed for {self.backend_name}: {exc}") from exc
+
+    def read_text(self) -> str | None:
+        return self._read_text_with_timeout(self.read_timeout)
+
+    def write_text(self, text: str) -> None:
+        self._write_text_with_timeout(text, self.write_timeout)
+
+    def probe_roundtrip(self, probe_text: str) -> str | None:
+        self._write_text_with_timeout(probe_text, self.probe_write_timeout)
+        return self._read_text_with_timeout(self.probe_read_timeout)
 
 
 class MemoryClipboardBackend:
@@ -137,6 +149,8 @@ def _build_backend(
     *,
     read_timeout: float,
     write_timeout: float,
+    probe_read_timeout: float,
+    probe_write_timeout: float,
     availability: Mapping[str, bool],
 ) -> CommandClipboardBackend | None:
     if backend_key == "wayland":
@@ -148,6 +162,8 @@ def _build_backend(
             backend_name="wayland-wl-clipboard",
             read_timeout=read_timeout,
             write_timeout=write_timeout,
+            probe_read_timeout=probe_read_timeout,
+            probe_write_timeout=probe_write_timeout,
         )
 
     if backend_key == "xclip":
@@ -159,6 +175,8 @@ def _build_backend(
             backend_name="xclip",
             read_timeout=read_timeout,
             write_timeout=write_timeout,
+            probe_read_timeout=probe_read_timeout,
+            probe_write_timeout=probe_write_timeout,
         )
 
     if backend_key == "xsel":
@@ -170,6 +188,8 @@ def _build_backend(
             backend_name="xsel",
             read_timeout=read_timeout,
             write_timeout=write_timeout,
+            probe_read_timeout=probe_read_timeout,
+            probe_write_timeout=probe_write_timeout,
         )
     return None
 
@@ -180,6 +200,8 @@ def _candidate_backends(
     backend_preference: str,
     read_timeout: float,
     write_timeout: float,
+    probe_read_timeout: float,
+    probe_write_timeout: float,
     availability: Mapping[str, bool] | None = None,
 ) -> list[CommandClipboardBackend]:
     resolved_availability = dict(_availability() if availability is None else availability)
@@ -189,6 +211,8 @@ def _candidate_backends(
             key,
             read_timeout=read_timeout,
             write_timeout=write_timeout,
+            probe_read_timeout=probe_read_timeout,
+            probe_write_timeout=probe_write_timeout,
             availability=resolved_availability,
         )
         if backend is not None:
@@ -198,8 +222,11 @@ def _candidate_backends(
 
 def _probe_backend(backend: ClipboardBackend) -> None:
     # Strict viability check: backend must support both write and read without timing out.
-    backend.write_text("CLIPSSH/PROBE")
-    text = backend.read_text()
+    if isinstance(backend, CommandClipboardBackend):
+        text = backend.probe_roundtrip("CLIPSSH/PROBE")
+    else:
+        backend.write_text("CLIPSSH/PROBE")
+        text = backend.read_text()
     if text is None:
         raise ClipboardError(f"Clipboard read probe failed for {backend.name()}: no text returned")
 
@@ -243,6 +270,8 @@ def detect_backend(
     backend_preference: str = "auto",
     read_timeout: float = 2.0,
     write_timeout: float = 2.0,
+    probe_read_timeout: float = 2.0,
+    probe_write_timeout: float = 2.0,
 ) -> ClipboardBackend:
     if backend_preference not in BACKEND_CHOICES:
         raise ClipboardError(
@@ -258,6 +287,8 @@ def detect_backend(
         backend_preference=backend_preference,
         read_timeout=max(read_timeout, 0.1),
         write_timeout=max(write_timeout, 0.1),
+        probe_read_timeout=max(probe_read_timeout, 0.1),
+        probe_write_timeout=max(probe_write_timeout, 0.1),
         availability=availability,
     )
     if not candidates:
