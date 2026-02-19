@@ -12,12 +12,13 @@ import time
 from typing import Iterator
 
 from .protocol import Message, decode_message, encode_message
+from .transport import TransportError
 
 DEFAULT_BRANCH_C2S = "gitssh2-c2s"
 DEFAULT_BRANCH_S2C = "gitssh2-s2c"
 
 
-class GitTransportError(RuntimeError):
+class GitTransportError(TransportError):
     """Raised when git transport operations fail."""
 
 
@@ -325,6 +326,10 @@ class GitTransportBackend:
 
     def _format_cmd(self, args: list[str]) -> str:
         return " ".join(["git", "--git-dir", str(self.local_repo_path), *args])
+
+    def close(self) -> None:
+        """API parity with stream transports."""
+        return None
 
     @contextmanager
     def _repo_lock(self) -> Iterator[None]:

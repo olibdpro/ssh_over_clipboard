@@ -1,9 +1,11 @@
 # clipssh
 
-`clipssh` is a local client/server SSH emulator with two transports:
+`clipssh` is a local client/server SSH emulator with four transports:
 
 - clipboard transport (`sshc` + `sshcd`)
 - git transport (`sshg` + `sshgd`)
+- usb-serial transport (`sshg --transport usb-serial` + `sshgd --transport usb-serial`)
+- audio-modem transport (`sshg --transport audio-modem` + `sshgd --transport audio-modem`)
 
 - Clipboard client/server: `sshc` / `sshcd`
 - Git client/server: `sshg` / `sshgd`
@@ -31,7 +33,11 @@ From this repository:
 python -m pip install -e .
 ```
 
-This exposes `sshc`, `sshcd`, `sshg`, and `sshgd` commands.
+This exposes:
+- `sshc`, `sshcd`
+- `sshg`, `sshgd`
+- `sshg-usb-probe`, `sshg-usb-gadget`
+- `sshg-audio-setup`, `sshg-audio-probe`
 
 ## Quick Start
 
@@ -101,6 +107,94 @@ sshg localhost \
 Then type commands at the prompt.
 `sshg` now opens a raw interactive PTY stream (no local `input()` prompt wrapper).
 
+### USB serial transport
+
+Use this when you have a serial link between peers (for example a USB device forwarded through a remoting stack):
+
+Terminal 1 (server side):
+
+```bash
+sshgd -v \
+  --transport usb-serial \
+  --serial-port /dev/ttyACM0
+```
+
+Terminal 2 (client side):
+
+```bash
+sshg localhost \
+  --transport usb-serial \
+  --serial-port /dev/ttyACM0
+```
+
+Probe local serial readiness:
+
+```bash
+sshg-usb-probe --list
+sshg-usb-probe --serial-port /dev/ttyACM0
+```
+
+Linux fake USB CDC gadget helper (root required):
+
+```bash
+sudo sshg-usb-gadget create
+sudo sshg-usb-gadget status
+sudo sshg-usb-gadget destroy
+```
+
+Notes:
+- `sshg-usb-gadget` requires a Linux host with USB gadget mode support (`/sys/class/udc` present).
+- On many laptops/desktops acting as USB hosts only, gadget mode is unavailable.
+- If using PCoIP USB redirection, your policy must allow forwarding the emulated class (CDC ACM).
+
+### Audio modem transport
+
+Audio-modem transport tunnels protocol messages through PCM audio streams.
+This is intended for environments where microphone/audio channels are available (for example PCoIP).
+
+Client host setup:
+
+```bash
+sshg-audio-setup create-client-devices
+sshg-audio-setup status
+```
+
+Optional VM/server-side setup:
+
+```bash
+sshg-audio-setup create-server-devices
+sshg-audio-setup status
+```
+
+Probe audio capture/playback:
+
+```bash
+sshg-audio-probe --duration 5 --tx --rx
+```
+
+Run server in VM:
+
+```bash
+sshgd -v \
+  --transport audio-modem \
+  --audio-input-device @DEFAULT_SOURCE@ \
+  --audio-output-device @DEFAULT_SINK@
+```
+
+Run client on host:
+
+```bash
+sshg localhost \
+  --transport audio-modem \
+  --audio-input-device sshg_rx_sink.monitor \
+  --audio-output-device sshg_tx_sink
+```
+
+Useful reliability knobs:
+- `--audio-byte-repeat` (simple error-correction repeat factor, default `3`)
+- `--audio-ack-timeout-ms` / `--audio-max-retries`
+- `--audio-marker-run` (frame delimiter marker length)
+
 ## Protocol Notes
 
 Clipboard messages use this wire prefix:
@@ -126,6 +220,15 @@ Git transport protocol details:
 - Protocol: `gitssh/2`
 - Interactive PTY message kinds: `pty_input`, `pty_output`, `pty_resize`, `pty_signal`, `pty_closed`
 
+USB serial transport details:
+- Uses the same `gitssh/2` message schema.
+- Wraps each message in a framed binary stream with CRC32 + ACK/retry.
+
+Audio-modem transport details:
+- Uses the same `gitssh/2` message schema.
+- Encodes link frames into PCM audio packets with markers + COBS framing.
+- Includes CRC32 integrity checks, deduplication, retransmission, and a simple repeat-code FEC.
+
 ## Limitations
 
 - Single active server session.
@@ -138,6 +241,10 @@ Git transport protocol details:
 - Best-effort reliability via retries + de-duplication.
 - Git transport requires a local `git` executable.
 - Git transport requires both peers to have access to the same upstream bare repo URL/path.
+- USB serial transport requires both peers to access the same forwarded serial channel.
+- USB gadget emulation requires root and Linux gadget-capable hardware on the emulating side.
+- Audio-modem transport requires ffmpeg and PulseAudio/PipeWire routing support.
+- Audio DSP (AGC/noise suppression/echo cancellation) can reduce reliability; tune remoting audio settings when possible.
 
 ## Testing
 

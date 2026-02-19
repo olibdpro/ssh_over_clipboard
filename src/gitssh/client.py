@@ -24,9 +24,11 @@ from .git_transport import (
     DEFAULT_BRANCH_C2S,
     DEFAULT_BRANCH_S2C,
     GitTransportBackend,
-    GitTransportError,
 )
+from .audio_modem_transport import AudioModemTransportBackend, AudioModemTransportConfig
 from .protocol import Message, build_message
+from .transport import TransportBackend, TransportError
+from .usb_serial_transport import USBSerialTransportBackend, USBSerialTransportConfig
 
 
 @dataclass
@@ -45,7 +47,7 @@ class ClientConfig:
 
 
 class GitSSHClient:
-    def __init__(self, backend: GitTransportBackend, config: ClientConfig) -> None:
+    def __init__(self, backend: TransportBackend, config: ClientConfig) -> None:
         self.backend = backend
         self.config = config
         self._state: EndpointState | None = None
@@ -113,7 +115,7 @@ class GitSSHClient:
             if now >= next_fetch:
                 try:
                     self.backend.fetch_inbound()
-                except GitTransportError as exc:
+                except TransportError as exc:
                     self._log(f"fetch failed: {exc}")
                 next_fetch = now + self.config.fetch_interval
                 did_work = True
@@ -121,7 +123,7 @@ class GitSSHClient:
             if now >= next_push:
                 try:
                     self.backend.push_outbound()
-                except GitTransportError as exc:
+                except TransportError as exc:
                     self._log(f"push failed: {exc}")
                 next_push = now + self.config.push_interval
                 did_work = True
@@ -137,16 +139,16 @@ class GitSSHClient:
     def _read_messages(self) -> list[Message]:
         try:
             messages, self._cursor = self.backend.read_inbound_messages(self._cursor)
-        except GitTransportError as exc:
-            self._log(f"git read failed: {exc}")
+        except TransportError as exc:
+            self._log(f"transport read failed: {exc}")
             return []
         return messages
 
     def _write_message(self, message: Message) -> None:
         try:
             self.backend.write_outbound_message(message)
-        except GitTransportError as exc:
-            raise RuntimeError(f"Failed to write git transport message: {exc}") from exc
+        except TransportError as exc:
+            raise RuntimeError(f"Failed to write transport message: {exc}") from exc
 
     def _update_prompt_context(self, body: dict[str, Any]) -> None:
         prompt = body.get("prompt")
@@ -456,6 +458,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("host", help="ssh-style target host (informational in this local emulator)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logs")
     parser.add_argument(
+        "--transport",
+        choices=["git", "usb-serial", "audio-modem"],
+        default="git",
+        help="Transport backend",
+    )
+    parser.add_argument(
         "--local-repo",
         default="/tmp/gitssh-client.git",
         help="Path to this client's local bare mirror repository",
@@ -474,6 +482,120 @@ def _build_parser() -> argparse.ArgumentParser:
         "--branch-s2c",
         default=DEFAULT_BRANCH_S2C,
         help="Branch used for server-to-client frames",
+    )
+    parser.add_argument(
+        "--serial-port",
+        default="/dev/ttyACM0",
+        help="Serial device path used by --transport usb-serial",
+    )
+    parser.add_argument(
+        "--serial-baud",
+        type=int,
+        default=3000000,
+        help="Requested serial baud rate for --transport usb-serial",
+    )
+    parser.add_argument(
+        "--serial-read-timeout-ms",
+        type=int,
+        default=5,
+        help="Serial read timeout in milliseconds for --transport usb-serial",
+    )
+    parser.add_argument(
+        "--serial-write-timeout-ms",
+        type=int,
+        default=20,
+        help="Serial write timeout in milliseconds for --transport usb-serial",
+    )
+    parser.add_argument(
+        "--serial-frame-max-bytes",
+        type=int,
+        default=65536,
+        help="Maximum encoded message bytes per serial frame",
+    )
+    parser.add_argument(
+        "--serial-ack-timeout-ms",
+        type=int,
+        default=150,
+        help="Retransmission timeout in milliseconds for serial data frames",
+    )
+    parser.add_argument(
+        "--serial-max-retries",
+        type=int,
+        default=20,
+        help="Maximum serial retransmissions before failing the session",
+    )
+    parser.add_argument(
+        "--serial-no-configure-tty",
+        action="store_true",
+        help="Do not apply raw termios settings to serial fd (debug/testing)",
+    )
+    parser.add_argument(
+        "--audio-input-device",
+        default="@DEFAULT_SOURCE@",
+        help="Input capture device for --transport audio-modem (Pulse/PipeWire name)",
+    )
+    parser.add_argument(
+        "--audio-output-device",
+        default="@DEFAULT_SINK@",
+        help="Output playback device for --transport audio-modem (Pulse/PipeWire name)",
+    )
+    parser.add_argument(
+        "--audio-sample-rate",
+        type=int,
+        default=48000,
+        help="PCM sample rate for --transport audio-modem",
+    )
+    parser.add_argument(
+        "--audio-read-timeout-ms",
+        type=int,
+        default=10,
+        help="Audio read timeout in milliseconds for --transport audio-modem",
+    )
+    parser.add_argument(
+        "--audio-write-timeout-ms",
+        type=int,
+        default=50,
+        help="Audio write timeout in milliseconds for --transport audio-modem",
+    )
+    parser.add_argument(
+        "--audio-frame-max-bytes",
+        type=int,
+        default=65536,
+        help="Maximum encoded message bytes per audio link frame",
+    )
+    parser.add_argument(
+        "--audio-ack-timeout-ms",
+        type=int,
+        default=200,
+        help="Retransmission timeout in milliseconds for audio data frames",
+    )
+    parser.add_argument(
+        "--audio-max-retries",
+        type=int,
+        default=32,
+        help="Maximum audio retransmissions before failing the session",
+    )
+    parser.add_argument(
+        "--audio-byte-repeat",
+        type=int,
+        default=3,
+        help="Simple forward-error-correction repeat factor for audio bytes",
+    )
+    parser.add_argument(
+        "--audio-marker-run",
+        type=int,
+        default=16,
+        help="Number of marker samples used to delimit audio frames",
+    )
+    parser.add_argument(
+        "--audio-backend",
+        default="pulse",
+        help="FFmpeg audio backend for --transport audio-modem (default: pulse)",
+    )
+    parser.add_argument(
+        "--audio-ffmpeg-bin",
+        default="ffmpeg",
+        help="ffmpeg executable path for --transport audio-modem",
     )
     parser.add_argument(
         "--poll-interval-ms",
@@ -537,19 +659,56 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _build_backend(args: argparse.Namespace) -> TransportBackend:
+    if args.transport == "usb-serial":
+        return USBSerialTransportBackend(
+            USBSerialTransportConfig(
+                serial_port=args.serial_port,
+                baud_rate=max(args.serial_baud, 1),
+                read_timeout=max(args.serial_read_timeout_ms / 1000.0, 0.0),
+                write_timeout=max(args.serial_write_timeout_ms / 1000.0, 0.001),
+                frame_max_bytes=max(args.serial_frame_max_bytes, 1024),
+                ack_timeout=max(args.serial_ack_timeout_ms / 1000.0, 0.01),
+                max_retries=max(args.serial_max_retries, 1),
+                configure_tty=not args.serial_no_configure_tty,
+            )
+        )
+
+    if args.transport == "audio-modem":
+        return AudioModemTransportBackend(
+            AudioModemTransportConfig(
+                input_device=args.audio_input_device,
+                output_device=args.audio_output_device,
+                sample_rate=max(args.audio_sample_rate, 8000),
+                read_timeout=max(args.audio_read_timeout_ms / 1000.0, 0.0),
+                write_timeout=max(args.audio_write_timeout_ms / 1000.0, 0.001),
+                frame_max_bytes=max(args.audio_frame_max_bytes, 1024),
+                ack_timeout=max(args.audio_ack_timeout_ms / 1000.0, 0.01),
+                max_retries=max(args.audio_max_retries, 1),
+                byte_repeat=max(args.audio_byte_repeat, 1),
+                marker_run=max(args.audio_marker_run, 4),
+                ffmpeg_bin=args.audio_ffmpeg_bin,
+                audio_backend=args.audio_backend,
+                verbose=args.verbose,
+            )
+        )
+
+    return GitTransportBackend(
+        local_repo_path=args.local_repo,
+        upstream_url=args.upstream_url,
+        inbound_branch=args.branch_s2c,
+        outbound_branch=args.branch_c2s,
+        auto_init_local=True,
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
     try:
-        backend = GitTransportBackend(
-            local_repo_path=args.local_repo,
-            upstream_url=args.upstream_url,
-            inbound_branch=args.branch_s2c,
-            outbound_branch=args.branch_c2s,
-            auto_init_local=True,
-        )
-    except GitTransportError as exc:
+        backend = _build_backend(args)
+    except TransportError as exc:
         print(f"sshg: {exc}", file=sys.stderr)
         return 2
 
@@ -578,6 +737,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"sshg: {exc}", file=sys.stderr)
         client.disconnect()
         return 1
+    finally:
+        backend.close()
 
 
 if __name__ == "__main__":

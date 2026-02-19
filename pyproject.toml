@@ -15,6 +15,10 @@ sshc = "clipssh.client:main"
 sshcd = "clipssh.server:main"
 sshg = "gitssh.client:main"
 sshgd = "gitssh.server:main"
+sshg-usb-probe = "gitssh.usb_probe:main"
+sshg-usb-gadget = "gitssh.usb_gadget:main"
+sshg-audio-setup = "gitssh.audio_setup:main"
+sshg-audio-probe = "gitssh.audio_probe:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
