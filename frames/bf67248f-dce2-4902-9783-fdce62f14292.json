@@ -1,0 +1,1 @@
+{"protocol":"gitssh/1","kind":"connect_req","session_id":"a3d721db-07d5-4ad5-ac1f-6a472d0d4e81","msg_id":"bf67248f-dce2-4902-9783-fdce62f14292","ts":"2026-02-19T20:19:09.950971Z","source":"client","target":"server","seq":1,"body":{"host":"localhost"}}
