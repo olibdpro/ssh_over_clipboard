@@ -132,9 +132,6 @@ class GitSSHServer:
             self._log(f"git write failed: {exc}")
             return
 
-        # Give the peer a chance to observe this commit before writing the next one.
-        time.sleep(max(self.config.poll_interval * 2.0, 0.02))
-
     def _make_message(self, *, kind: str, session_id: str, body: Any = None) -> Message:
         return build_message(
             kind=kind,

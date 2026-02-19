@@ -154,13 +154,6 @@ class GitTransportBackend:
             delay = self.conflict_retry_delay
 
             for attempt in range(self.push_retries):
-                # Use latest upstream outbound tip as parent to minimize push conflicts.
-                self._fetch_branch_to_local(
-                    branch=self.outbound_branch,
-                    local_ref=self.outbound_ref,
-                    allow_missing=True,
-                )
-
                 commit_id = self._commit_frame_on_outbound(
                     message=message,
                     payload=payload,
@@ -172,6 +165,11 @@ class GitTransportBackend:
 
                 if self._is_non_fast_forward_error(push_error):
                     if attempt + 1 < self.push_retries:
+                        self._fetch_branch_to_local(
+                            branch=self.outbound_branch,
+                            local_ref=self.outbound_ref,
+                            allow_missing=True,
+                        )
                         time.sleep(delay)
                         delay = min(delay * 2.0, 0.5)
                         continue
