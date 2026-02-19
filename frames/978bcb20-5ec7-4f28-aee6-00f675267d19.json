@@ -1,0 +1,1 @@
+{"protocol":"gitssh/1","kind":"cmd","session_id":"a3d721db-07d5-4ad5-ac1f-6a472d0d4e81","msg_id":"978bcb20-5ec7-4f28-aee6-00f675267d19","ts":"2026-02-19T20:20:18.136542Z","source":"client","target":"server","seq":3,"body":{"command":"ssh mtlgpu1","cmd_id":"6f85d343-b94c-418a-8bfa-3dfbbe172ac1"}}
