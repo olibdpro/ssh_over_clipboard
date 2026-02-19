@@ -6,14 +6,25 @@ from typing import Any
 
 from sshcore.protocol import (
     Message,
-    VALID_KINDS,
     build_message as _build_message,
     decode_message as _decode_message,
     encode_message as _encode_message,
 )
 
-PROTOCOL_NAME = "gitssh/1"
+PROTOCOL_NAME = "gitssh/2"
 WIRE_PREFIX = ""
+VALID_KINDS = {
+    "connect_req",
+    "connect_ack",
+    "pty_input",
+    "pty_output",
+    "pty_resize",
+    "pty_signal",
+    "pty_closed",
+    "disconnect",
+    "error",
+    "busy",
+}
 
 
 
@@ -38,6 +49,7 @@ def build_message(
         msg_id=msg_id,
         ts=ts,
         protocol_name=PROTOCOL_NAME,
+        valid_kinds=VALID_KINDS,
     )
 
 
@@ -52,4 +64,5 @@ def decode_message(text: str | None) -> Message | None:
         text,
         protocol_name=PROTOCOL_NAME,
         wire_prefix=WIRE_PREFIX,
+        valid_kinds=VALID_KINDS,
     )

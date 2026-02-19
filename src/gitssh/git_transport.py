@@ -13,8 +13,8 @@ from typing import Iterator
 
 from .protocol import Message, decode_message, encode_message
 
-DEFAULT_BRANCH_C2S = "gitssh-c2s"
-DEFAULT_BRANCH_S2C = "gitssh-s2c"
+DEFAULT_BRANCH_C2S = "gitssh2-c2s"
+DEFAULT_BRANCH_S2C = "gitssh2-s2c"
 
 
 class GitTransportError(RuntimeError):

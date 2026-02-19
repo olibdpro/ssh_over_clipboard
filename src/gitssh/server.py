@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 from dataclasses import dataclass, field
+import getpass
 import socket
 import sys
 import threading
 import time
 from typing import Any
+import uuid
 
+from sshcore.pty_shell import PtyShellError, PtyShellSession
 from sshcore.session import EndpointState
-from sshcore.shell import ShellExecutionError, ShellSession, resolve_shell
+from sshcore.shell import resolve_shell
 
 from .git_transport import (
     DEFAULT_BRANCH_C2S,
@@ -25,9 +30,10 @@ from .protocol import Message, build_message
 @dataclass
 class ServerConfig:
     poll_interval: float = 0.1
-    max_output_chunk: int = 32768
+    max_output_chunk: int = 4096
     preferred_shell: str = "tcsh"
     command_timeout: float = 120.0
+    io_flush_interval: float = 0.02
     fetch_interval: float = 0.1
     push_interval: float = 0.1
     verbose: bool = False
@@ -36,8 +42,10 @@ class ServerConfig:
 @dataclass
 class ActiveSession:
     state: EndpointState
-    shell: ShellSession
-    command_cache: dict[str, list[Message]] = field(default_factory=dict)
+    shell: PtyShellSession
+    stream_id: str
+    pending_output: bytearray = field(default_factory=bytearray)
+    last_flush_at: float = field(default_factory=time.monotonic)
 
 
 class GitSSHServer:
@@ -130,7 +138,6 @@ class GitSSHServer:
             self.backend.write_outbound_message(message)
         except GitTransportError as exc:
             self._log(f"git write failed: {exc}")
-            return
 
     def _make_message(self, *, kind: str, session_id: str, body: Any = None) -> Message:
         return build_message(
@@ -142,12 +149,6 @@ class GitSSHServer:
             body=body,
         )
 
-    def _chunk_text(self, text: str) -> list[str]:
-        if not text:
-            return []
-        size = max(self.config.max_output_chunk, 1)
-        return [text[i : i + size] for i in range(0, len(text), size)]
-
     def _server_hostname(self) -> str | None:
         try:
             hostname = socket.gethostname()
@@ -156,18 +157,11 @@ class GitSSHServer:
             return None
 
     def _collect_prompt_context(self) -> dict[str, str | None]:
-        host = self._server_hostname()
-        if self._active is None:
-            return {"user": None, "cwd": None, "host": host}
-
-        try:
-            user, cwd = self._active.shell.read_prompt_context(
-                timeout=min(self.config.command_timeout, 10.0),
-            )
-            return {"user": user, "cwd": cwd, "host": host}
-        except ShellExecutionError as exc:
-            self._log(f"failed to read prompt context: {exc}")
-            return {"user": None, "cwd": None, "host": host}
+        return {
+            "user": getpass.getuser(),
+            "cwd": None,
+            "host": self._server_hostname(),
+        }
 
     def _close_active_session(self) -> None:
         if self._active is None:
@@ -177,16 +171,51 @@ class GitSSHServer:
         self._active.shell.close()
         self._active = None
 
+    def _term_size_from_connect(self, message: Message) -> tuple[int, int]:
+        cols = 80
+        rows = 24
+
+        body = message.body if isinstance(message.body, dict) else {}
+        pty = body.get("pty")
+        if isinstance(pty, dict):
+            raw_cols = pty.get("cols")
+            raw_rows = pty.get("rows")
+            if isinstance(raw_cols, int):
+                cols = max(raw_cols, 1)
+            if isinstance(raw_rows, int):
+                rows = max(raw_rows, 1)
+
+        return cols, rows
+
+    def _session_error(self, *, session_id: str, text: str) -> None:
+        self._write_message(
+            self._make_message(
+                kind="error",
+                session_id=session_id,
+                body={"error": text},
+            )
+        )
+
+    def _connect_ack_body(self, *, stream_id: str, shell_path: str) -> dict[str, Any]:
+        return {
+            "shell": shell_path,
+            "backend": self.backend.name(),
+            "stream_id": stream_id,
+            "prompt": self._collect_prompt_context(),
+        }
+
     def _handle_connect(self, message: Message) -> None:
         if self._active is not None:
             if message.session_id == self._active.state.session_id:
                 self._log(f"re-acknowledging session {message.session_id}")
-                prompt_context = self._collect_prompt_context()
                 self._write_message(
                     self._make_message(
                         kind="connect_ack",
                         session_id=message.session_id,
-                        body={"backend": self.backend.name(), "prompt": prompt_context},
+                        body=self._connect_ack_body(
+                            stream_id=self._active.stream_id,
+                            shell_path=self._active.shell.shell_path,
+                        ),
                     )
                 )
                 return
@@ -201,102 +230,176 @@ class GitSSHServer:
             )
             return
 
+        cols, rows = self._term_size_from_connect(message)
+
         try:
-            shell_path, shell_flavor = resolve_shell(self.config.preferred_shell)
-            shell = ShellSession(shell_path=shell_path, shell_flavor=shell_flavor)
+            shell_path, _shell_flavor = resolve_shell(self.config.preferred_shell)
+            shell = PtyShellSession(shell_path=shell_path, cols=cols, rows=rows)
         except Exception as exc:
-            self._write_message(
-                self._make_message(
-                    kind="error",
-                    session_id=message.session_id,
-                    body={"error": f"failed to start shell: {exc}"},
-                )
+            self._session_error(
+                session_id=message.session_id,
+                text=f"failed to start pty shell: {exc}",
             )
             return
 
-        self._active = ActiveSession(state=EndpointState(session_id=message.session_id), shell=shell)
-        self._log(
-            f"accepted session {message.session_id} using {shell_path} ({shell_flavor})"
+        stream_id = str(uuid.uuid4())
+        self._active = ActiveSession(
+            state=EndpointState(session_id=message.session_id),
+            shell=shell,
+            stream_id=stream_id,
         )
-        prompt_context = self._collect_prompt_context()
+
+        self._log(
+            f"accepted session {message.session_id} using {shell_path} (stream_id={stream_id})"
+        )
         self._write_message(
             self._make_message(
                 kind="connect_ack",
                 session_id=message.session_id,
-                body={"shell": shell_path, "backend": self.backend.name(), "prompt": prompt_context},
+                body=self._connect_ack_body(stream_id=stream_id, shell_path=shell_path),
             )
         )
 
-    def _emit_command_messages(self, outgoing: list[Message]) -> None:
-        for frame in outgoing:
-            self._write_message(frame)
+    def _emit_pty_output(self, session: ActiveSession, payload: bytes) -> None:
+        encoded = base64.b64encode(payload).decode("ascii")
+        self._write_message(
+            self._make_message(
+                kind="pty_output",
+                session_id=session.state.session_id,
+                body={"stream_id": session.stream_id, "data_b64": encoded},
+            )
+        )
 
-    def _handle_command(self, message: Message, is_new: bool) -> None:
-        if self._active is None:
+    def _flush_pending_output(self, *, force: bool = False) -> None:
+        session = self._active
+        if session is None or not session.pending_output:
             return
 
-        cached = self._active.command_cache.get(message.msg_id)
-        if not is_new:
-            if cached:
-                self._log(f"replaying cached response for command msg {message.msg_id}")
-                self._emit_command_messages(cached)
+        chunk_size = max(self.config.max_output_chunk, 1)
+
+        def should_flush() -> bool:
+            if force:
+                return True
+            if len(session.pending_output) >= chunk_size:
+                return True
+            return (time.monotonic() - session.last_flush_at) >= max(self.config.io_flush_interval, 0.0)
+
+        while session.pending_output and should_flush():
+            data = bytes(session.pending_output[:chunk_size])
+            del session.pending_output[:chunk_size]
+            self._emit_pty_output(session, data)
+            session.last_flush_at = time.monotonic()
+            if not force and len(session.pending_output) < chunk_size:
+                break
+
+    def _drain_pty_output(self) -> None:
+        session = self._active
+        if session is None:
+            return
+
+        chunk_size = max(self.config.max_output_chunk, 1)
+        while True:
+            try:
+                data = session.shell.read_output(timeout=0.0, max_bytes=chunk_size)
+            except PtyShellError as exc:
+                self._log(f"pty output read failed: {exc}")
+                break
+            if not data:
+                break
+            session.pending_output.extend(data)
+            self._flush_pending_output(force=False)
+
+        self._flush_pending_output(force=False)
+
+    def _handle_pty_input(self, message: Message) -> None:
+        session = self._active
+        if session is None:
             return
 
         body = message.body if isinstance(message.body, dict) else {}
-        command = body.get("command") if isinstance(body, dict) else None
-        cmd_id = body.get("cmd_id") if isinstance(body, dict) else None
-        if not isinstance(command, str) or not isinstance(cmd_id, str):
-            error_frame = self._make_message(
-                kind="error",
+        stream_id = body.get("stream_id")
+        data_b64 = body.get("data_b64")
+        if stream_id != session.stream_id:
+            self._session_error(
                 session_id=message.session_id,
-                body={"error": "cmd payload must contain string fields 'command' and 'cmd_id'"},
+                text="pty_input stream_id does not match active stream",
             )
-            self._active.command_cache[message.msg_id] = [error_frame]
-            self._write_message(error_frame)
+            return
+        if not isinstance(data_b64, str):
+            self._session_error(
+                session_id=message.session_id,
+                text="pty_input payload must contain string field 'data_b64'",
+            )
             return
 
-        self._log(f"executing command for session {message.session_id}: {command!r}")
         try:
-            stdout, stderr, code = self._active.shell.execute(
-                command,
-                timeout=self.config.command_timeout,
-            )
-        except ShellExecutionError as exc:
-            stdout = ""
-            stderr = f"{exc}\n"
-            code = 1
+            data = base64.b64decode(data_b64, validate=True)
+        except (ValueError, binascii.Error):
+            self._session_error(session_id=message.session_id, text="pty_input contains invalid base64 data")
+            return
 
-        outgoing: list[Message] = []
+        if not data:
+            return
 
-        for chunk in self._chunk_text(stdout):
-            outgoing.append(
-                self._make_message(
-                    kind="stdout",
-                    session_id=message.session_id,
-                    body={"cmd_id": cmd_id, "data": chunk},
-                )
-            )
+        try:
+            session.shell.write_input(data)
+        except PtyShellError as exc:
+            self._session_error(session_id=message.session_id, text=f"failed to write PTY input: {exc}")
 
-        for chunk in self._chunk_text(stderr):
-            outgoing.append(
-                self._make_message(
-                    kind="stderr",
-                    session_id=message.session_id,
-                    body={"cmd_id": cmd_id, "data": chunk},
-                )
-            )
+    def _handle_pty_resize(self, message: Message) -> None:
+        session = self._active
+        if session is None:
+            return
 
-        prompt_context = self._collect_prompt_context()
-        outgoing.append(
-            self._make_message(
-                kind="exit",
+        body = message.body if isinstance(message.body, dict) else {}
+        stream_id = body.get("stream_id")
+        cols = body.get("cols")
+        rows = body.get("rows")
+
+        if stream_id != session.stream_id:
+            self._session_error(
                 session_id=message.session_id,
-                body={"cmd_id": cmd_id, "exit_code": code, "prompt": prompt_context},
+                text="pty_resize stream_id does not match active stream",
             )
-        )
+            return
+        if not isinstance(cols, int) or not isinstance(rows, int):
+            self._session_error(
+                session_id=message.session_id,
+                text="pty_resize payload must contain integer fields 'cols' and 'rows'",
+            )
+            return
 
-        self._active.command_cache[message.msg_id] = outgoing
-        self._emit_command_messages(outgoing)
+        try:
+            session.shell.resize(cols=max(cols, 1), rows=max(rows, 1))
+        except PtyShellError as exc:
+            self._session_error(session_id=message.session_id, text=f"failed to resize PTY: {exc}")
+
+    def _handle_pty_signal(self, message: Message) -> None:
+        session = self._active
+        if session is None:
+            return
+
+        body = message.body if isinstance(message.body, dict) else {}
+        stream_id = body.get("stream_id")
+        signal_name = body.get("signal")
+
+        if stream_id != session.stream_id:
+            self._session_error(
+                session_id=message.session_id,
+                text="pty_signal stream_id does not match active stream",
+            )
+            return
+        if not isinstance(signal_name, str):
+            self._session_error(
+                session_id=message.session_id,
+                text="pty_signal payload must contain string field 'signal'",
+            )
+            return
+
+        try:
+            session.shell.send_signal(signal_name)
+        except PtyShellError as exc:
+            self._session_error(session_id=message.session_id, text=f"failed to send signal to PTY: {exc}")
 
     def _handle_disconnect(self, message: Message) -> None:
         self._log(f"disconnect requested for session {message.session_id}")
@@ -309,16 +412,29 @@ class GitSSHServer:
             return
 
         is_new = self._active.state.incoming_seen.mark(message.msg_id)
-
-        if message.kind == "cmd":
-            self._handle_command(message, is_new=is_new)
+        if not is_new:
             return
 
-        if not is_new:
+        if message.kind == "pty_input":
+            self._handle_pty_input(message)
+            return
+
+        if message.kind == "pty_resize":
+            self._handle_pty_resize(message)
+            return
+
+        if message.kind == "pty_signal":
+            self._handle_pty_signal(message)
             return
 
         if message.kind == "disconnect":
             self._handle_disconnect(message)
+            return
+
+        self._session_error(
+            session_id=message.session_id,
+            text=f"Unsupported session message kind: {message.kind}",
+        )
 
     def _handle_message(self, message: Message) -> None:
         if message.target != "server":
@@ -332,6 +448,28 @@ class GitSSHServer:
             return
 
         self._handle_session_message(message)
+
+    def _check_for_shell_exit(self) -> None:
+        session = self._active
+        if session is None:
+            return
+        if session.shell.is_alive():
+            return
+
+        self._flush_pending_output(force=True)
+
+        exit_code = session.shell.wait_exit(timeout=0.0)
+        if exit_code is None:
+            exit_code = 1
+
+        self._write_message(
+            self._make_message(
+                kind="pty_closed",
+                session_id=session.state.session_id,
+                body={"stream_id": session.stream_id, "exit_code": exit_code},
+            )
+        )
+        self._close_active_session()
 
     def serve_forever(self, stop_event: threading.Event | None = None) -> None:
         self._log(f"server started with backend={self.backend.name()}")
@@ -348,11 +486,13 @@ class GitSSHServer:
                 for message in self._read_messages():
                     self._handle_message(message)
 
+                self._drain_pty_output()
+                self._check_for_shell_exit()
+
                 time.sleep(self.config.poll_interval)
         finally:
             self._stop_sync_worker()
             self._close_active_session()
-
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -392,14 +532,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-output-chunk",
         type=int,
-        default=32768,
-        help="Maximum size of each stdout/stderr message chunk",
+        default=4096,
+        help="Maximum size of each pty_output payload in bytes before base64 encoding",
+    )
+    parser.add_argument(
+        "--io-flush-interval",
+        type=float,
+        default=0.02,
+        help="Maximum seconds to hold buffered PTY output before emitting a frame",
     )
     parser.add_argument(
         "--command-timeout",
         type=float,
         default=120.0,
-        help="Maximum seconds to wait for a command to finish",
+        help="Deprecated compatibility option (unused in PTY mode)",
     )
     parser.add_argument(
         "--fetch-interval",
@@ -414,7 +560,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Seconds between background push operations",
     )
     return parser
-
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -438,6 +583,7 @@ def main(argv: list[str] | None = None) -> int:
         max_output_chunk=max(args.max_output_chunk, 1),
         preferred_shell=args.shell,
         command_timeout=max(args.command_timeout, 1.0),
+        io_flush_interval=max(args.io_flush_interval, 0.0),
         fetch_interval=max(args.fetch_interval, 0.02),
         push_interval=max(args.push_interval, 0.02),
         verbose=args.verbose,

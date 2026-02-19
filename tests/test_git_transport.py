@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import pathlib
 import shutil
 import subprocess
@@ -154,12 +155,15 @@ class GitTransportTests(unittest.TestCase):
                 auto_init_local=False,
             )
             message = build_message(
-                kind="cmd",
+                kind="pty_input",
                 session_id=str(uuid.uuid4()),
                 source="client",
                 target="server",
                 seq=index + 1,
-                body={"command": f"echo writer-{index}", "cmd_id": str(uuid.uuid4())},
+                body={
+                    "stream_id": str(uuid.uuid4()),
+                    "data_b64": base64.b64encode(f"writer-{index}\n".encode()).decode("ascii"),
+                },
             )
             writer_backend.write_outbound_message(message)
 

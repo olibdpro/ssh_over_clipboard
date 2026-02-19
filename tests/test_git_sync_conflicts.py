@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import pathlib
 import shutil
 import subprocess
@@ -84,12 +85,15 @@ class GitSyncConflictTests(unittest.TestCase):
         def write_batch(backend: GitTransportBackend, prefix: str) -> None:
             for i in range(per_writer):
                 message = build_message(
-                    kind="cmd",
+                    kind="pty_input",
                     session_id=str(uuid.uuid4()),
                     source="client",
                     target="server",
                     seq=i + 1,
-                    body={"command": f"echo {prefix}-{i}", "cmd_id": str(uuid.uuid4())},
+                    body={
+                        "stream_id": str(uuid.uuid4()),
+                        "data_b64": base64.b64encode(f"{prefix}-{i}\n".encode()).decode("ascii"),
+                    },
                 )
                 backend.write_outbound_message(message)
                 with written_ids_lock:

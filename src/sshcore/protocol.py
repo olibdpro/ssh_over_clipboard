@@ -63,8 +63,11 @@ def build_message(
     msg_id: str | None = None,
     ts: str | None = None,
     protocol_name: str,
+    valid_kinds: set[str] | None = None,
 ) -> Message:
-    if kind not in VALID_KINDS:
+    allowed_kinds = valid_kinds or VALID_KINDS
+
+    if kind not in allowed_kinds:
         raise ValueError(f"Unsupported message kind: {kind}")
     if source not in {"client", "server"}:
         raise ValueError(f"Unsupported source: {source}")
@@ -99,7 +102,12 @@ def encode_message(message: Message, *, wire_prefix: str = "") -> str:
 
 
 
-def _validate_payload(payload: Any, *, protocol_name: str) -> Message | None:
+def _validate_payload(
+    payload: Any,
+    *,
+    protocol_name: str,
+    valid_kinds: set[str],
+) -> Message | None:
     if not isinstance(payload, dict):
         return None
 
@@ -119,7 +127,7 @@ def _validate_payload(payload: Any, *, protocol_name: str) -> Message | None:
 
     if payload["protocol"] != protocol_name:
         return None
-    if payload["kind"] not in VALID_KINDS:
+    if payload["kind"] not in valid_kinds:
         return None
     if payload["source"] not in {"client", "server"}:
         return None
@@ -151,6 +159,7 @@ def decode_message(
     *,
     protocol_name: str,
     wire_prefix: str = "",
+    valid_kinds: set[str] | None = None,
 ) -> Message | None:
     if not text:
         return None
@@ -165,4 +174,8 @@ def decode_message(
     except json.JSONDecodeError:
         return None
 
-    return _validate_payload(payload, protocol_name=protocol_name)
+    return _validate_payload(
+        payload,
+        protocol_name=protocol_name,
+        valid_kinds=valid_kinds or VALID_KINDS,
+    )

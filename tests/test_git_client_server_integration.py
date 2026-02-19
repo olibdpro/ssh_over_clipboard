@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+import base64
 import pathlib
-import socket
 import shutil
 import subprocess
 import sys
@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -25,7 +26,6 @@ from gitssh.server import GitSSHServer, ServerConfig
 
 
 GIT_AVAILABLE = shutil.which("git") is not None
-
 
 
 def _init_bare_repo(path: str) -> None:
@@ -61,9 +61,10 @@ class GitClientServerIntegrationTests(unittest.TestCase):
             backend=self.server_backend,
             config=ServerConfig(
                 poll_interval=0.02,
-                max_output_chunk=8,
+                max_output_chunk=512,
                 preferred_shell="sh",
                 command_timeout=5.0,
+                io_flush_interval=0.01,
                 fetch_interval=0.02,
                 push_interval=0.02,
                 verbose=False,
@@ -99,31 +100,85 @@ class GitClientServerIntegrationTests(unittest.TestCase):
                 retry_interval=0.05,
                 fetch_interval=0.02,
                 push_interval=0.02,
+                stdin_batch_interval=0.01,
+                input_chunk_bytes=256,
+                resize_debounce=0.01,
+                no_raw=True,
                 verbose=False,
             ),
         )
 
-    def test_connect_execute_disconnect(self) -> None:
+    def _read_stream_until(
+        self,
+        client: GitSSHClient,
+        *,
+        expected_text: str | None = None,
+        wait_close: bool = False,
+        timeout: float = 5.0,
+    ) -> tuple[str, int | None]:
+        state = client._ensure_state()
+        stream_id = client._ensure_stream_id()
+
+        captured = bytearray()
+        closed_code: int | None = None
+        deadline = time.monotonic() + timeout
+
+        while time.monotonic() < deadline:
+            for incoming in client._read_messages():
+                if incoming.target != "client" or incoming.source != "server":
+                    continue
+                if incoming.session_id != state.session_id:
+                    continue
+                if not state.incoming_seen.mark(incoming.msg_id):
+                    continue
+
+                body = incoming.body if isinstance(incoming.body, dict) else {}
+
+                if incoming.kind == "pty_output" and body.get("stream_id") == stream_id:
+                    data_b64 = body.get("data_b64")
+                    if isinstance(data_b64, str):
+                        try:
+                            captured.extend(base64.b64decode(data_b64, validate=True))
+                        except Exception:
+                            continue
+
+                elif incoming.kind == "pty_closed" and body.get("stream_id") == stream_id:
+                    raw = body.get("exit_code", 1)
+                    try:
+                        closed_code = int(raw)
+                    except (TypeError, ValueError):
+                        closed_code = 1
+                    if wait_close:
+                        return captured.decode(errors="ignore"), closed_code
+
+                elif incoming.kind == "error":
+                    message = body.get("error", "unknown server error")
+                    raise AssertionError(f"server reported error: {message}")
+
+            decoded = captured.decode(errors="ignore")
+            if expected_text and expected_text in decoded:
+                return decoded, closed_code
+            if wait_close and closed_code is not None:
+                return decoded, closed_code
+
+            time.sleep(0.02)
+
+        return captured.decode(errors="ignore"), closed_code
+
+    def test_connect_and_stream_io(self) -> None:
         client = self._make_client()
-        results = client.run_commands(
-            "localhost",
-            ["echo hello", "cd /tmp", "printf 'err\\n' 1>&2; /bin/sh -c 'exit 3'"],
-        )
+        client.connect("localhost")
+        try:
+            self.assertTrue(client.is_connected)
+            self.assertIsInstance(client._stream_id, str)
+            self.assertTrue(bool(client._stream_id))
 
-        self.assertEqual(len(results), 3)
-        self.assertIn("hello", results[0].stdout)
-        self.assertEqual(results[0].exit_code, 0)
-        self.assertIsInstance(results[0].prompt_user, str)
-        self.assertTrue(bool(results[0].prompt_user))
-        self.assertIsInstance(results[0].prompt_cwd, str)
-        self.assertTrue(bool(results[0].prompt_cwd))
-
-        self.assertEqual(results[1].exit_code, 0)
-        self.assertEqual(results[1].prompt_cwd, "/tmp")
-
-        self.assertIn("err", results[2].stderr)
-        self.assertEqual(results[2].exit_code, 3)
-        self.assertEqual(results[2].prompt_cwd, "/tmp")
+            marker = f"PTY-{uuid.uuid4().hex}"
+            client._send_pty_input(f"echo {marker}\n".encode())
+            output, _closed_code = self._read_stream_until(client, expected_text=marker)
+            self.assertIn(marker, output)
+        finally:
+            client.disconnect()
 
     def test_busy_when_second_client_connects(self) -> None:
         client1 = self._make_client()
@@ -136,14 +191,13 @@ class GitClientServerIntegrationTests(unittest.TestCase):
         finally:
             client1.disconnect()
 
-    def test_first_prompt_is_populated_on_connect_ack(self) -> None:
+    def test_server_emits_pty_closed_on_shell_exit(self) -> None:
         client = self._make_client()
         client.connect("localhost")
         try:
-            prompt = client._render_prompt("localhost")
-            self.assertIn(f"@{socket.gethostname()}:", prompt)
-            self.assertTrue(prompt.endswith("$ "))
-            self.assertNotEqual(prompt, "sshg> ")
+            client._send_pty_input(b"exit 7\n")
+            _output, closed_code = self._read_stream_until(client, wait_close=True)
+            self.assertEqual(closed_code, 7)
         finally:
             client.disconnect()
 

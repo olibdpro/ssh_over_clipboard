@@ -8,6 +8,7 @@
 - Clipboard client/server: `sshc` / `sshcd`
 - Git client/server: `sshg` / `sshgd`
 - Security: none (intended for local experimentation only)
+- Git transport now uses a PTY byte stream (`gitssh/2`) for interactive shells.
 
 ## Requirements
 
@@ -98,7 +99,7 @@ sshg localhost \
 ```
 
 Then type commands at the prompt.
-The first prompt is initialized from server handshake metadata as `user@host:cwd$`.
+`sshg` now opens a raw interactive PTY stream (no local `input()` prompt wrapper).
 
 ## Protocol Notes
 
@@ -116,16 +117,20 @@ Payload is JSON containing:
 Non-protocol clipboard entries are ignored.
 
 Git transport stores one protocol frame per commit and syncs through:
-- client->server branch: `gitssh-c2s`
-- server->client branch: `gitssh-s2c`
+- client->server branch: `gitssh2-c2s`
+- server->client branch: `gitssh2-s2c`
 
 Each peer keeps its own local bare mirror and continuously fetches/pushes against the upstream remote.
+
+Git transport protocol details:
+- Protocol: `gitssh/2`
+- Interactive PTY message kinds: `pty_input`, `pty_output`, `pty_resize`, `pty_signal`, `pty_closed`
 
 ## Limitations
 
 - Single active server session.
 - No encryption, authentication, or login checks.
-- Command/response mode, not full TTY emulation.
+- Git transport is PTY-stream based and supports interactive terminal applications, but remains latency-sensitive due to commit-based transport.
 - Clipboard is shared with normal copy/paste, so user clipboard activity can interfere.
 - Clipboard tools (`wl-copy`/`wl-paste`, `xsel`, `xclip`) are native system executables.
   If missing, use your distro package manager or Conda (`conda install -c conda-forge wl-clipboard xsel xclip`).

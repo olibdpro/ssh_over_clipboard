@@ -6,7 +6,7 @@ from typing import Any
 
 from sshcore.protocol import (
     Message,
-    VALID_KINDS,
+    VALID_KINDS as CORE_VALID_KINDS,
     build_message as _build_message,
     decode_message as _decode_message,
     encode_message as _encode_message,
@@ -14,6 +14,7 @@ from sshcore.protocol import (
 
 PROTOCOL_NAME = "clipssh/1"
 WIRE_PREFIX = "CLIPSSH/1 "
+VALID_KINDS = set(CORE_VALID_KINDS)
 
 
 
@@ -38,6 +39,7 @@ def build_message(
         msg_id=msg_id,
         ts=ts,
         protocol_name=PROTOCOL_NAME,
+        valid_kinds=VALID_KINDS,
     )
 
 
@@ -52,4 +54,5 @@ def decode_message(text: str | None) -> Message | None:
         text,
         protocol_name=PROTOCOL_NAME,
         wire_prefix=WIRE_PREFIX,
+        valid_kinds=VALID_KINDS,
     )

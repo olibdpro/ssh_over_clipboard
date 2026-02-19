@@ -3,11 +3,19 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 from dataclasses import dataclass
+import os
+import select
+import shutil
+import signal
 import sys
+import termios
 import threading
 import time
-from typing import Any
+import tty
+from typing import Any, Callable
 import uuid
 
 from sshcore.session import EndpointState
@@ -29,17 +37,11 @@ class ClientConfig:
     retry_interval: float = 0.5
     fetch_interval: float = 0.1
     push_interval: float = 0.1
+    stdin_batch_interval: float = 0.02
+    input_chunk_bytes: int = 4096
+    resize_debounce: float = 0.1
+    no_raw: bool = False
     verbose: bool = False
-
-
-@dataclass
-class CommandResult:
-    stdout: str
-    stderr: str
-    exit_code: int
-    prompt_user: str | None = None
-    prompt_cwd: str | None = None
-    prompt_host: str | None = None
 
 
 class GitSSHClient:
@@ -48,6 +50,7 @@ class GitSSHClient:
         self.config = config
         self._state: EndpointState | None = None
         self._cursor: str | None = None
+        self._stream_id: str | None = None
         self._prompt_user: str | None = None
         self._prompt_cwd: str | None = None
         self._prompt_host: str | None = None
@@ -60,12 +63,17 @@ class GitSSHClient:
 
     @property
     def is_connected(self) -> bool:
-        return self._state is not None
+        return self._state is not None and self._stream_id is not None
 
     def _ensure_state(self) -> EndpointState:
         if self._state is None:
             raise RuntimeError("Not connected")
         return self._state
+
+    def _ensure_stream_id(self) -> str:
+        if self._stream_id is None:
+            raise RuntimeError("PTY stream is not established")
+        return self._stream_id
 
     def _start_sync_worker(self) -> None:
         if self._sync_thread is not None and self._sync_thread.is_alive():
@@ -155,15 +163,9 @@ class GitSSHClient:
         if isinstance(host, str) and host:
             self._prompt_host = host
 
-    def _render_prompt(self, host: str) -> str:
-        display_host = self._prompt_host or host
-        if self._prompt_user and self._prompt_cwd:
-            return f"{self._prompt_user}@{display_host}:{self._prompt_cwd}$ "
-        if self._prompt_cwd:
-            return f"{display_host}:{self._prompt_cwd}$ "
-        if self._prompt_user:
-            return f"{self._prompt_user}@{display_host}$ "
-        return "sshg> "
+    def _terminal_size(self) -> tuple[int, int]:
+        size = shutil.get_terminal_size(fallback=(80, 24))
+        return max(size.columns, 1), max(size.lines, 1)
 
     def connect(self, host: str) -> None:
         if self._state is not None:
@@ -172,6 +174,7 @@ class GitSSHClient:
         self._prompt_user = None
         self._prompt_cwd = None
         self._prompt_host = None
+        self._stream_id = None
 
         self._start_sync_worker()
 
@@ -181,13 +184,14 @@ class GitSSHClient:
 
             session_id = str(uuid.uuid4())
             state = EndpointState(session_id=session_id)
+            cols, rows = self._terminal_size()
             connect_message = build_message(
                 kind="connect_req",
                 session_id=session_id,
                 source="client",
                 target="server",
                 seq=state.outgoing_seq.next(),
-                body={"host": host},
+                body={"host": host, "pty": {"cols": cols, "rows": rows}},
             )
 
             deadline = time.monotonic() + self.config.connect_timeout
@@ -213,8 +217,12 @@ class GitSSHClient:
                     if incoming.kind == "connect_ack":
                         body = incoming.body if isinstance(incoming.body, dict) else {}
                         self._update_prompt_context(body)
+                        stream_id = body.get("stream_id")
+                        if not isinstance(stream_id, str) or not stream_id:
+                            raise RuntimeError("Server connect_ack did not include stream_id")
+                        self._stream_id = stream_id
                         self._state = state
-                        self._log(f"connected with session {session_id}")
+                        self._log(f"connected with session {session_id}, stream_id={stream_id}")
                         return
 
                     if incoming.kind == "busy":
@@ -233,93 +241,45 @@ class GitSSHClient:
             raise TimeoutError("Timed out waiting for server connect_ack")
         except Exception:
             self._state = None
+            self._stream_id = None
             self._stop_sync_worker()
             raise
 
-    def execute(
-        self,
-        command: str,
-        *,
-        on_stdout=None,
-        on_stderr=None,
-    ) -> CommandResult:
+    def _write_pty_message(self, *, kind: str, body: dict[str, Any]) -> None:
         state = self._ensure_state()
-
-        cmd_id = str(uuid.uuid4())
-        cmd_message = build_message(
-            kind="cmd",
+        message = build_message(
+            kind=kind,
             session_id=state.session_id,
             source="client",
             target="server",
             seq=state.outgoing_seq.next(),
-            body={"command": command, "cmd_id": cmd_id},
+            body=body,
+        )
+        self._write_message(message)
+
+    def _send_pty_input(self, data: bytes) -> None:
+        if not data:
+            return
+        stream_id = self._ensure_stream_id()
+        encoded = base64.b64encode(data).decode("ascii")
+        self._write_pty_message(
+            kind="pty_input",
+            body={"stream_id": stream_id, "data_b64": encoded},
         )
 
-        stdout_parts: list[str] = []
-        stderr_parts: list[str] = []
+    def _send_pty_resize(self, cols: int, rows: int) -> None:
+        stream_id = self._ensure_stream_id()
+        self._write_pty_message(
+            kind="pty_resize",
+            body={"stream_id": stream_id, "cols": max(cols, 1), "rows": max(rows, 1)},
+        )
 
-        next_send = 0.0
-        last_activity = time.monotonic()
-
-        while True:
-            now = time.monotonic()
-            if now >= next_send:
-                self._write_message(cmd_message)
-                next_send = now + self.config.retry_interval
-
-            for incoming in self._read_messages():
-                if incoming.target != "client" or incoming.source != "server":
-                    continue
-                if incoming.session_id != state.session_id:
-                    continue
-                if not state.incoming_seen.mark(incoming.msg_id):
-                    continue
-
-                body = incoming.body if isinstance(incoming.body, dict) else {}
-
-                if incoming.kind in {"stdout", "stderr", "exit"} and body.get("cmd_id") != cmd_id:
-                    continue
-
-                if incoming.kind == "stdout":
-                    chunk = body.get("data", "")
-                    if isinstance(chunk, str):
-                        stdout_parts.append(chunk)
-                        if on_stdout is not None:
-                            on_stdout(chunk)
-                    last_activity = now
-
-                elif incoming.kind == "stderr":
-                    chunk = body.get("data", "")
-                    if isinstance(chunk, str):
-                        stderr_parts.append(chunk)
-                        if on_stderr is not None:
-                            on_stderr(chunk)
-                    last_activity = now
-
-                elif incoming.kind == "exit":
-                    self._update_prompt_context(body)
-                    code_raw = body.get("exit_code", 1)
-                    try:
-                        exit_code = int(code_raw)
-                    except (TypeError, ValueError):
-                        exit_code = 1
-                    return CommandResult(
-                        stdout="".join(stdout_parts),
-                        stderr="".join(stderr_parts),
-                        exit_code=exit_code,
-                        prompt_user=self._prompt_user,
-                        prompt_cwd=self._prompt_cwd,
-                        prompt_host=self._prompt_host,
-                    )
-
-                elif incoming.kind == "error":
-                    message = body.get("error", "unknown server error")
-                    raise RuntimeError(str(message))
-
-            if now - last_activity > self.config.session_timeout:
-                raise TimeoutError("Timed out waiting for command response")
-
-            time.sleep(self.config.poll_interval)
+    def _send_pty_signal(self, signal_name: str) -> None:
+        stream_id = self._ensure_stream_id()
+        self._write_pty_message(
+            kind="pty_signal",
+            body={"stream_id": stream_id, "signal": signal_name},
+        )
 
     def disconnect(self) -> None:
         try:
@@ -338,54 +298,157 @@ class GitSSHClient:
             self._write_message(message)
         finally:
             self._state = None
+            self._stream_id = None
             self._prompt_user = None
             self._prompt_cwd = None
             self._prompt_host = None
             self._stop_sync_worker()
 
-    def run_commands(self, host: str, commands: list[str]) -> list[CommandResult]:
-        self.connect(host)
-        results: list[CommandResult] = []
-        try:
-            for command in commands:
-                results.append(self.execute(command))
-        finally:
-            self.disconnect()
-        return results
+    def _handle_incoming_message(
+        self,
+        incoming: Message,
+        *,
+        on_output: Callable[[bytes], None],
+    ) -> int | None:
+        state = self._ensure_state()
+        stream_id = self._ensure_stream_id()
+
+        if incoming.target != "client" or incoming.source != "server":
+            return None
+        if incoming.session_id != state.session_id:
+            return None
+        if not state.incoming_seen.mark(incoming.msg_id):
+            return None
+
+        body = incoming.body if isinstance(incoming.body, dict) else {}
+
+        if incoming.kind == "pty_output":
+            if body.get("stream_id") != stream_id:
+                return None
+            data_b64 = body.get("data_b64")
+            if not isinstance(data_b64, str):
+                return None
+            try:
+                payload = base64.b64decode(data_b64, validate=True)
+            except (ValueError, binascii.Error):
+                return None
+            if payload:
+                on_output(payload)
+            return None
+
+        if incoming.kind == "pty_closed":
+            if body.get("stream_id") != stream_id:
+                return None
+            raw_code = body.get("exit_code", 1)
+            try:
+                return int(raw_code)
+            except (TypeError, ValueError):
+                return 1
+
+        if incoming.kind == "error":
+            message = body.get("error", "unknown server error")
+            raise RuntimeError(str(message))
+
+        return None
 
     def run_interactive(self, host: str) -> int:
         self.connect(host)
 
-        def emit_stdout(chunk: str) -> None:
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
+        stdin_fd = sys.stdin.fileno()
+        stdout_fd = sys.stdout.fileno()
 
-        def emit_stderr(chunk: str) -> None:
-            sys.stderr.write(chunk)
-            sys.stderr.flush()
+        raw_enabled = os.isatty(stdin_fd) and not self.config.no_raw
+        original_tty: list[Any] | None = None
+        previous_winch_handler = signal.getsignal(signal.SIGWINCH)
+
+        resize_pending = False
+
+        def on_sigwinch(_signum: int, _frame: Any) -> None:
+            nonlocal resize_pending
+            resize_pending = True
+
+        def emit_output(data: bytes) -> None:
+            if not data:
+                return
+            try:
+                os.write(stdout_fd, data)
+            except OSError:
+                pass
+
+        exit_code = 0
 
         try:
+            if raw_enabled:
+                original_tty = termios.tcgetattr(stdin_fd)
+                tty.setraw(stdin_fd)
+
+            signal.signal(signal.SIGWINCH, on_sigwinch)
+            resize_pending = True
+
+            input_buffer = bytearray()
+            last_input_flush = time.monotonic()
+            next_resize_send = 0.0
+            last_activity = time.monotonic()
+
             while True:
-                try:
-                    line = input(self._render_prompt(host))
-                except EOFError:
-                    print()
-                    break
-                except KeyboardInterrupt:
-                    print()
-                    continue
+                now = time.monotonic()
 
-                if not line.strip():
-                    continue
+                if resize_pending and now >= next_resize_send:
+                    cols, rows = self._terminal_size()
+                    self._send_pty_resize(cols, rows)
+                    resize_pending = False
+                    next_resize_send = now + self.config.resize_debounce
 
-                result = self.execute(line, on_stdout=emit_stdout, on_stderr=emit_stderr)
-                if self.config.verbose:
-                    print(f"[sshg] exit_code={result.exit_code}", file=sys.stderr)
+                for incoming in self._read_messages():
+                    maybe_exit = self._handle_incoming_message(incoming, on_output=emit_output)
+                    if maybe_exit is not None:
+                        exit_code = maybe_exit
+                        return exit_code
+                    last_activity = now
+
+                if input_buffer and (
+                    len(input_buffer) >= self.config.input_chunk_bytes
+                    or (now - last_input_flush) >= self.config.stdin_batch_interval
+                ):
+                    self._send_pty_input(bytes(input_buffer))
+                    input_buffer.clear()
+                    last_input_flush = now
+                    last_activity = now
+
+                ready, _, _ = select.select([stdin_fd], [], [], self.config.poll_interval)
+                if ready:
+                    try:
+                        data = os.read(stdin_fd, self.config.input_chunk_bytes)
+                    except KeyboardInterrupt:
+                        self._send_pty_signal("INT")
+                        continue
+
+                    if not data:
+                        return exit_code
+
+                    input_buffer.extend(data)
+                    if len(input_buffer) >= self.config.input_chunk_bytes:
+                        self._send_pty_input(bytes(input_buffer))
+                        input_buffer.clear()
+                        last_input_flush = now
+                        last_activity = now
+
+                if (time.monotonic() - last_activity) > self.config.session_timeout:
+                    raise TimeoutError("Timed out waiting for PTY stream activity")
+
         finally:
+            try:
+                signal.signal(signal.SIGWINCH, previous_winch_handler)
+            except Exception:
+                pass
+
+            if original_tty is not None:
+                try:
+                    termios.tcsetattr(stdin_fd, termios.TCSADRAIN, original_tty)
+                except termios.error:
+                    pass
+
             self.disconnect()
-
-        return 0
-
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -428,13 +491,13 @@ def _build_parser() -> argparse.ArgumentParser:
         "--session-timeout",
         type=float,
         default=300.0,
-        help="Maximum idle seconds waiting for command output",
+        help="Maximum idle seconds waiting for stream activity",
     )
     parser.add_argument(
         "--retry-interval",
         type=float,
         default=0.5,
-        help="Seconds between retransmitting connect/cmd requests",
+        help="Seconds between retransmitting connect requests",
     )
     parser.add_argument(
         "--fetch-interval",
@@ -448,8 +511,30 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.1,
         help="Seconds between background push operations",
     )
+    parser.add_argument(
+        "--stdin-batch-ms",
+        type=int,
+        default=20,
+        help="Milliseconds to batch stdin bytes before sending a pty_input frame",
+    )
+    parser.add_argument(
+        "--input-chunk-bytes",
+        type=int,
+        default=4096,
+        help="Maximum bytes in each pty_input payload before base64 encoding",
+    )
+    parser.add_argument(
+        "--resize-debounce-ms",
+        type=int,
+        default=100,
+        help="Minimum milliseconds between emitted pty_resize messages",
+    )
+    parser.add_argument(
+        "--no-raw",
+        action="store_true",
+        help="Do not enable local raw terminal mode (debug/fallback)",
+    )
     return parser
-
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -475,6 +560,10 @@ def main(argv: list[str] | None = None) -> int:
         retry_interval=max(args.retry_interval, 0.05),
         fetch_interval=max(args.fetch_interval, 0.02),
         push_interval=max(args.push_interval, 0.02),
+        stdin_batch_interval=max(args.stdin_batch_ms / 1000.0, 0.001),
+        input_chunk_bytes=max(args.input_chunk_bytes, 1),
+        resize_debounce=max(args.resize_debounce_ms / 1000.0, 0.0),
+        no_raw=args.no_raw,
         verbose=args.verbose,
     )
 
