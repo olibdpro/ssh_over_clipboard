@@ -138,11 +138,34 @@ class FFmpegAudioDuplexIO:
         os.set_blocking(self._tx_fd, False)
         self._closed = False
 
+        # Fail fast when ffmpeg exits immediately due to bad device/backend config.
+        if self._capture.poll() is not None:
+            raise AudioIOError(self._process_error(self._capture, "ffmpeg capture"))
+        if self._playback.poll() is not None:
+            raise AudioIOError(self._process_error(self._playback, "ffmpeg playback"))
+
+    def _process_error(self, proc: subprocess.Popen[bytes] | subprocess.Popen[str], label: str) -> str:
+        stderr_text = ""
+        try:
+            if proc.stderr is not None:
+                raw = proc.stderr.read()
+                if isinstance(raw, bytes):
+                    stderr_text = raw.decode("utf-8", errors="ignore")
+                else:
+                    stderr_text = raw or ""
+        except Exception:
+            stderr_text = ""
+
+        cleaned = (stderr_text or "").strip()
+        if cleaned:
+            return f"{label} process exited unexpectedly: {cleaned}"
+        return f"{label} process exited unexpectedly"
+
     def read(self, max_bytes: int) -> bytes:
         if self._closed:
             return b""
         if self._capture.poll() is not None:
-            raise AudioIOError("ffmpeg capture process exited unexpectedly")
+            raise AudioIOError(self._process_error(self._capture, "ffmpeg capture"))
         if max_bytes < 1:
             return b""
 
@@ -162,7 +185,7 @@ class FFmpegAudioDuplexIO:
         if self._closed or not data:
             return
         if self._playback.poll() is not None:
-            raise AudioIOError("ffmpeg playback process exited unexpectedly")
+            raise AudioIOError(self._process_error(self._playback, "ffmpeg playback"))
 
         view = memoryview(data)
         deadline = self.write_timeout
@@ -205,4 +228,3 @@ class FFmpegAudioDuplexIO:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=1.0)
-

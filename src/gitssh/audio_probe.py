@@ -13,8 +13,8 @@ from .audio_io_ffmpeg import AudioIOError, FFmpegAudioDuplexIO
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sshg-audio-probe", description="Probe ffmpeg audio capture/playback paths")
-    parser.add_argument("--input-device", default="@DEFAULT_SOURCE@", help="Capture device name")
-    parser.add_argument("--output-device", default="@DEFAULT_SINK@", help="Playback device name")
+    parser.add_argument("--input-device", default="default", help="Capture device name")
+    parser.add_argument("--output-device", default="default", help="Playback device name")
     parser.add_argument("--sample-rate", type=int, default=48000, help="PCM sample rate")
     parser.add_argument("--duration", type=float, default=5.0, help="Probe duration in seconds")
     parser.add_argument("--tx", action="store_true", help="Emit probe tone to playback path")

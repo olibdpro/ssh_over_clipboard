@@ -172,13 +172,21 @@ Probe audio capture/playback:
 sshg-audio-probe --duration 5 --tx --rx
 ```
 
+Probe explicit virtual devices created by `sshg-audio-setup`:
+
+```bash
+sshg-audio-probe --tx --rx --duration 5 \
+  --input-device sshg_vm_mic \
+  --output-device sshg_vm_sink
+```
+
 Run server in VM:
 
 ```bash
 sshgd -v \
   --transport audio-modem \
-  --audio-input-device @DEFAULT_SOURCE@ \
-  --audio-output-device @DEFAULT_SINK@
+  --audio-input-device default \
+  --audio-output-device default
 ```
 
 Run client on host:
@@ -189,6 +197,10 @@ sshg localhost \
   --audio-input-device sshg_rx_sink.monitor \
   --audio-output-device sshg_tx_sink
 ```
+
+Troubleshooting:
+- If `sshg-audio-probe` reports ffmpeg capture/playback exit, rerun with explicit `--input-device` and `--output-device`.
+- Run `pactl list short sources` / `pactl list short sinks` and select concrete device names.
 
 Useful reliability knobs:
 - `--audio-byte-repeat` (simple error-correction repeat factor, default `3`)

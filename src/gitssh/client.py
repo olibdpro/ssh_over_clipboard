@@ -531,12 +531,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--audio-input-device",
-        default="@DEFAULT_SOURCE@",
+        default="default",
         help="Input capture device for --transport audio-modem (Pulse/PipeWire name)",
     )
     parser.add_argument(
         "--audio-output-device",
-        default="@DEFAULT_SINK@",
+        default="default",
         help="Output playback device for --transport audio-modem (Pulse/PipeWire name)",
     )
     parser.add_argument(
