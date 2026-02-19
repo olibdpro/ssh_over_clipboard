@@ -1,10 +1,12 @@
 # clipssh
 
-`clipssh` is a local client/server SSH emulator that uses the system clipboard as its transport.
+`clipssh` is a local client/server SSH emulator with two transports:
 
-- Client command: `sshc`
-- Server daemon: `sshcd`
-- Transport: clipboard polling + tagged protocol messages
+- clipboard transport (`sshc` + `sshcd`)
+- git transport (`sshg` + `sshgd`)
+
+- Clipboard client/server: `sshc` / `sshcd`
+- Git client/server: `sshg` / `sshgd`
 - Security: none (intended for local experimentation only)
 
 ## Requirements
@@ -28,9 +30,11 @@ From this repository:
 python -m pip install -e .
 ```
 
-This exposes `sshc` and `sshcd` commands.
+This exposes `sshc`, `sshcd`, `sshg`, and `sshgd` commands.
 
 ## Quick Start
+
+### Clipboard transport
 
 Terminal 1:
 
@@ -45,6 +49,32 @@ sshc localhost
 ```
 
 Then type commands at the `sshc> ` prompt.
+
+### Git transport (shared upstream)
+
+Initialize one upstream bare repo that both peers can access:
+
+```bash
+git init --bare /tmp/gitssh-upstream.git
+```
+
+Terminal 1:
+
+```bash
+sshgd -v \
+  --upstream-url /tmp/gitssh-upstream.git \
+  --local-repo /tmp/gitssh-server.git
+```
+
+Terminal 2:
+
+```bash
+sshg localhost \
+  --upstream-url /tmp/gitssh-upstream.git \
+  --local-repo /tmp/gitssh-client.git
+```
+
+Then type commands at the `sshg> ` prompt.
 
 ## Protocol Notes
 
@@ -61,6 +91,12 @@ Payload is JSON containing:
 
 Non-protocol clipboard entries are ignored.
 
+Git transport stores one protocol frame per commit and syncs through:
+- client->server branch: `gitssh-c2s`
+- server->client branch: `gitssh-s2c`
+
+Each peer keeps its own local bare mirror and continuously fetches/pushes against the upstream remote.
+
 ## Limitations
 
 - Single active server session.
@@ -68,6 +104,8 @@ Non-protocol clipboard entries are ignored.
 - Command/response mode, not full TTY emulation.
 - Clipboard is shared with normal copy/paste, so user clipboard activity can interfere.
 - Best-effort reliability via retries + de-duplication.
+- Git transport requires a local `git` executable.
+- Git transport requires both peers to have access to the same upstream bare repo URL/path.
 
 ## Testing
 

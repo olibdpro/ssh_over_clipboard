@@ -13,6 +13,8 @@ dependencies = []
 [project.scripts]
 sshc = "clipssh.client:main"
 sshcd = "clipssh.server:main"
+sshg = "gitssh.client:main"
+sshgd = "gitssh.server:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

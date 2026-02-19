@@ -1,4 +1,4 @@
-"""Message protocol for clipboard transport."""
+"""Message protocol for git transport."""
 
 from __future__ import annotations
 
@@ -12,8 +12,8 @@ from sshcore.protocol import (
     encode_message as _encode_message,
 )
 
-PROTOCOL_NAME = "clipssh/1"
-WIRE_PREFIX = "CLIPSSH/1 "
+PROTOCOL_NAME = "gitssh/1"
+WIRE_PREFIX = ""
 
 
 
