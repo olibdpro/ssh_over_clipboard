@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import pathlib
+import socket
 import shutil
 import subprocess
 import sys
@@ -106,15 +107,23 @@ class GitClientServerIntegrationTests(unittest.TestCase):
         client = self._make_client()
         results = client.run_commands(
             "localhost",
-            ["echo hello", "printf 'err\\n' 1>&2; /bin/sh -c 'exit 3'"],
+            ["echo hello", "cd /tmp", "printf 'err\\n' 1>&2; /bin/sh -c 'exit 3'"],
         )
 
-        self.assertEqual(len(results), 2)
+        self.assertEqual(len(results), 3)
         self.assertIn("hello", results[0].stdout)
         self.assertEqual(results[0].exit_code, 0)
+        self.assertIsInstance(results[0].prompt_user, str)
+        self.assertTrue(bool(results[0].prompt_user))
+        self.assertIsInstance(results[0].prompt_cwd, str)
+        self.assertTrue(bool(results[0].prompt_cwd))
 
-        self.assertIn("err", results[1].stderr)
-        self.assertEqual(results[1].exit_code, 3)
+        self.assertEqual(results[1].exit_code, 0)
+        self.assertEqual(results[1].prompt_cwd, "/tmp")
+
+        self.assertIn("err", results[2].stderr)
+        self.assertEqual(results[2].exit_code, 3)
+        self.assertEqual(results[2].prompt_cwd, "/tmp")
 
     def test_busy_when_second_client_connects(self) -> None:
         client1 = self._make_client()
@@ -126,6 +135,17 @@ class GitClientServerIntegrationTests(unittest.TestCase):
                 client2.connect("localhost")
         finally:
             client1.disconnect()
+
+    def test_first_prompt_is_populated_on_connect_ack(self) -> None:
+        client = self._make_client()
+        client.connect("localhost")
+        try:
+            prompt = client._render_prompt("localhost")
+            self.assertIn(f"@{socket.gethostname()}:", prompt)
+            self.assertTrue(prompt.endswith("$ "))
+            self.assertNotEqual(prompt, "sshg> ")
+        finally:
+            client.disconnect()
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
+import socket
 import sys
 import threading
 import time
@@ -81,6 +82,27 @@ class ClipboardSSHServer:
         size = max(self.config.max_output_chunk, 1)
         return [text[i : i + size] for i in range(0, len(text), size)]
 
+    def _server_hostname(self) -> str | None:
+        try:
+            hostname = socket.gethostname()
+            return hostname or None
+        except OSError:
+            return None
+
+    def _collect_prompt_context(self) -> dict[str, str | None]:
+        host = self._server_hostname()
+        if self._active is None:
+            return {"user": None, "cwd": None, "host": host}
+
+        try:
+            user, cwd = self._active.shell.read_prompt_context(
+                timeout=min(self.config.command_timeout, 10.0),
+            )
+            return {"user": user, "cwd": cwd, "host": host}
+        except ShellExecutionError as exc:
+            self._log(f"failed to read prompt context: {exc}")
+            return {"user": None, "cwd": None, "host": host}
+
     def _close_active_session(self) -> None:
         if self._active is None:
             return
@@ -93,11 +115,12 @@ class ClipboardSSHServer:
         if self._active is not None:
             if message.session_id == self._active.state.session_id:
                 self._log(f"re-acknowledging session {message.session_id}")
+                prompt_context = self._collect_prompt_context()
                 self._write_message(
                     self._make_message(
                         kind="connect_ack",
                         session_id=message.session_id,
-                        body={"backend": self.backend.name()},
+                        body={"backend": self.backend.name(), "prompt": prompt_context},
                     )
                 )
                 return
@@ -129,11 +152,12 @@ class ClipboardSSHServer:
         self._log(
             f"accepted session {message.session_id} using {shell_path} ({shell_flavor})"
         )
+        prompt_context = self._collect_prompt_context()
         self._write_message(
             self._make_message(
                 kind="connect_ack",
                 session_id=message.session_id,
-                body={"shell": shell_path, "backend": self.backend.name()},
+                body={"shell": shell_path, "backend": self.backend.name(), "prompt": prompt_context},
             )
         )
 
@@ -196,11 +220,12 @@ class ClipboardSSHServer:
                 )
             )
 
+        prompt_context = self._collect_prompt_context()
         outgoing.append(
             self._make_message(
                 kind="exit",
                 session_id=message.session_id,
-                body={"cmd_id": cmd_id, "exit_code": code},
+                body={"cmd_id": cmd_id, "exit_code": code, "prompt": prompt_context},
             )
         )
 

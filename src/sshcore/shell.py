@@ -13,6 +13,9 @@ from typing import Literal
 import uuid
 
 MARKER_PREFIX = "__CLIPSSH_DONE__"
+PROMPT_USER_MARKER = "__CLIPSSH_PROMPT_USER__"
+PROMPT_CWD_MARKER = "__CLIPSSH_PROMPT_CWD__"
+PROMPT_END_MARKER = "__CLIPSSH_PROMPT_END__"
 
 
 class ShellUnavailableError(RuntimeError):
@@ -170,6 +173,46 @@ class ShellSession:
                 stderr_parts.append(line)
 
         return "".join(stdout_parts), "".join(stderr_parts), exit_code
+
+    def read_prompt_context(self, timeout: float = 10.0) -> tuple[str | None, str | None]:
+        """Returns (user, cwd) from the current shell state."""
+        probe = (
+            f'echo "{PROMPT_USER_MARKER}"\n'
+            "whoami\n"
+            f'echo "{PROMPT_CWD_MARKER}"\n'
+            "pwd\n"
+            f'echo "{PROMPT_END_MARKER}"\n'
+        )
+        stdout, _stderr, _code = self.execute(probe, timeout=timeout)
+
+        user: str | None = None
+        cwd: str | None = None
+        state: str | None = None
+
+        for raw_line in stdout.splitlines():
+            line = raw_line.strip()
+            if line == PROMPT_USER_MARKER:
+                state = "user"
+                continue
+            if line == PROMPT_CWD_MARKER:
+                state = "cwd"
+                continue
+            if line == PROMPT_END_MARKER:
+                break
+
+            if not line:
+                continue
+
+            if state == "user" and user is None:
+                user = line
+                state = None
+                continue
+
+            if state == "cwd" and cwd is None:
+                cwd = line
+                state = None
+
+        return user, cwd
 
     def close(self) -> None:
         if self._proc is None:

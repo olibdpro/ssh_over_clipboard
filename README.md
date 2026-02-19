@@ -48,7 +48,8 @@ Terminal 2:
 sshc localhost
 ```
 
-Then type commands at the `sshc> ` prompt.
+Then type commands at the prompt.
+The first prompt is initialized from server handshake metadata as `user@host:cwd$`.
 
 ### Git transport (shared upstream)
 
@@ -74,7 +75,8 @@ sshg localhost \
   --local-repo /tmp/gitssh-client.git
 ```
 
-Then type commands at the `sshg> ` prompt.
+Then type commands at the prompt.
+The first prompt is initialized from server handshake metadata as `user@host:cwd$`.
 
 ## Protocol Notes
 

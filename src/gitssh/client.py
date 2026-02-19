@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import sys
 import threading
 import time
+from typing import Any
 import uuid
 
 from sshcore.session import EndpointState
@@ -36,6 +37,9 @@ class CommandResult:
     stdout: str
     stderr: str
     exit_code: int
+    prompt_user: str | None = None
+    prompt_cwd: str | None = None
+    prompt_host: str | None = None
 
 
 class GitSSHClient:
@@ -44,6 +48,9 @@ class GitSSHClient:
         self.config = config
         self._state: EndpointState | None = None
         self._cursor: str | None = None
+        self._prompt_user: str | None = None
+        self._prompt_cwd: str | None = None
+        self._prompt_host: str | None = None
         self._sync_stop: threading.Event | None = None
         self._sync_thread: threading.Thread | None = None
 
@@ -133,9 +140,38 @@ class GitSSHClient:
         except GitTransportError as exc:
             raise RuntimeError(f"Failed to write git transport message: {exc}") from exc
 
+    def _update_prompt_context(self, body: dict[str, Any]) -> None:
+        prompt = body.get("prompt")
+        if not isinstance(prompt, dict):
+            return
+
+        user = prompt.get("user")
+        cwd = prompt.get("cwd")
+        host = prompt.get("host")
+        if isinstance(user, str) and user:
+            self._prompt_user = user
+        if isinstance(cwd, str) and cwd:
+            self._prompt_cwd = cwd
+        if isinstance(host, str) and host:
+            self._prompt_host = host
+
+    def _render_prompt(self, host: str) -> str:
+        display_host = self._prompt_host or host
+        if self._prompt_user and self._prompt_cwd:
+            return f"{self._prompt_user}@{display_host}:{self._prompt_cwd}$ "
+        if self._prompt_cwd:
+            return f"{display_host}:{self._prompt_cwd}$ "
+        if self._prompt_user:
+            return f"{self._prompt_user}@{display_host}$ "
+        return "sshg> "
+
     def connect(self, host: str) -> None:
         if self._state is not None:
             raise RuntimeError("Already connected")
+
+        self._prompt_user = None
+        self._prompt_cwd = None
+        self._prompt_host = None
 
         self._start_sync_worker()
 
@@ -175,6 +211,8 @@ class GitSSHClient:
                         continue
 
                     if incoming.kind == "connect_ack":
+                        body = incoming.body if isinstance(incoming.body, dict) else {}
+                        self._update_prompt_context(body)
                         self._state = state
                         self._log(f"connected with session {session_id}")
                         return
@@ -259,6 +297,7 @@ class GitSSHClient:
                     last_activity = now
 
                 elif incoming.kind == "exit":
+                    self._update_prompt_context(body)
                     code_raw = body.get("exit_code", 1)
                     try:
                         exit_code = int(code_raw)
@@ -268,6 +307,9 @@ class GitSSHClient:
                         stdout="".join(stdout_parts),
                         stderr="".join(stderr_parts),
                         exit_code=exit_code,
+                        prompt_user=self._prompt_user,
+                        prompt_cwd=self._prompt_cwd,
+                        prompt_host=self._prompt_host,
                     )
 
                 elif incoming.kind == "error":
@@ -296,6 +338,9 @@ class GitSSHClient:
             self._write_message(message)
         finally:
             self._state = None
+            self._prompt_user = None
+            self._prompt_cwd = None
+            self._prompt_host = None
             self._stop_sync_worker()
 
     def run_commands(self, host: str, commands: list[str]) -> list[CommandResult]:
@@ -322,7 +367,7 @@ class GitSSHClient:
         try:
             while True:
                 try:
-                    line = input("sshg> ")
+                    line = input(self._render_prompt(host))
                 except EOFError:
                     print()
                     break
