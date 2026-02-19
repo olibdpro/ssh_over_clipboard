@@ -1,1 +1,0 @@
-{"protocol":"gitssh/1","kind":"cmd","session_id":"600b5999-40b2-4112-a8d7-df58e1f1d121","msg_id":"8441d979-523c-4230-be42-d86caed02f68","ts":"2026-02-19T20:45:33.875788Z","source":"client","target":"server","seq":2,"body":{"command":"cd /hosts/mtlnfs19/user_data/FACELAB/REF/montreal/users/obdu/repos/Chrono","cmd_id":"e091c9d9-144d-4b0b-a1d2-56306cf2e176"}}
