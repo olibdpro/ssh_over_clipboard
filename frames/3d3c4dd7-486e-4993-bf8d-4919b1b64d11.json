@@ -1,0 +1,1 @@
+{"protocol":"gitssh/2","kind":"busy","session_id":"3f4b8996-6bb3-499b-9c46-032fc47f6b6d","msg_id":"3d3c4dd7-486e-4993-bf8d-4919b1b64d11","ts":"2026-02-19T22:30:11.158875Z","source":"server","target":"client","seq":20,"body":{"reason":"server has an active session"}}
