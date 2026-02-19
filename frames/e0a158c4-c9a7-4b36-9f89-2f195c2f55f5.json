@@ -1,0 +1,1 @@
+{"protocol":"gitssh/1","kind":"connect_ack","session_id":"a3d721db-07d5-4ad5-ac1f-6a472d0d4e81","msg_id":"e0a158c4-c9a7-4b36-9f89-2f195c2f55f5","ts":"2026-02-19T20:19:13.651471Z","source":"server","target":"client","seq":3,"body":{"backend":"git:/tmp/gitssh-server.git (upstream=https://github.com/olibdpro/ssh_over_unknown.git, in=gitssh-c2s, out=gitssh-s2c)"}}
