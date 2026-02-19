@@ -1,1 +1,0 @@
-{"protocol":"gitssh/1","kind":"cmd","session_id":"600b5999-40b2-4112-a8d7-df58e1f1d121","msg_id":"09d42f02-67bb-4e9d-b73d-c7449aceddb7","ts":"2026-02-19T20:45:57.658688Z","source":"client","target":"server","seq":3,"body":{"command":"tail train4gpu.log","cmd_id":"81a007bc-90f0-4af3-ab1d-697f542d760b"}}
