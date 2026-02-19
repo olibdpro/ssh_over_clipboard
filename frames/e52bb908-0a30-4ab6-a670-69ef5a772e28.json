@@ -1,0 +1,1 @@
+{"protocol":"gitssh/2","kind":"pty_input","session_id":"e06ad6e4-3073-4eef-b9eb-809edde2c80b","msg_id":"e52bb908-0a30-4ab6-a670-69ef5a772e28","ts":"2026-02-19T22:33:23.442631Z","source":"client","target":"server","seq":33,"body":{"stream_id":"e44b04b3-20e1-49a2-9772-94a2bb528cc8","data_b64":"DQ=="}}
