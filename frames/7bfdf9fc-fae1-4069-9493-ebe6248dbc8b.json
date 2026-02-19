@@ -1,0 +1,1 @@
+{"protocol":"gitssh/1","kind":"stdout","session_id":"a3d721db-07d5-4ad5-ac1f-6a472d0d4e81","msg_id":"7bfdf9fc-fae1-4069-9493-ebe6248dbc8b","ts":"2026-02-19T20:19:29.092705Z","source":"server","target":"client","seq":4,"body":{"cmd_id":"4dd142fe-1c89-47b8-aaf3-af49d7e7737d","data":"pyproject.toml\nREADME.md\nsrc\ntests\n"}}
