@@ -1,1 +1,0 @@
-{"protocol":"gitssh/1","kind":"cmd","session_id":"c06179fd-d597-4940-a8f2-db2e11cd1688","msg_id":"a98ad649-a8cf-4296-b8e8-c0592c464497","ts":"2026-02-19T20:41:11.117709Z","source":"client","target":"server","seq":2,"body":{"command":"ls","cmd_id":"4b9f12eb-f812-4988-a2aa-fb4df44b33e1"}}
