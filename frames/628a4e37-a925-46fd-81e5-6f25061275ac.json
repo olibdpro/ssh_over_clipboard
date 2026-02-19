@@ -1,1 +1,0 @@
-{"protocol":"gitssh/1","kind":"stderr","session_id":"a3d721db-07d5-4ad5-ac1f-6a472d0d4e81","msg_id":"628a4e37-a925-46fd-81e5-6f25061275ac","ts":"2026-02-19T20:19:29.092730Z","source":"server","target":"client","seq":5,"body":{"cmd_id":"4dd142fe-1c89-47b8-aaf3-af49d7e7737d","data":"stty: 'standard input': Inappropriate ioctl for device\n"}}
