@@ -34,6 +34,15 @@ class PtyShellSession:
         rows = max(int(rows), 1)
 
         master_fd, slave_fd = pty.openpty()
+
+        def _preexec() -> None:
+            os.setsid()
+            try:
+                fcntl.ioctl(slave_fd, termios.TIOCSCTTY, 0)
+            except OSError:
+                # Some environments already have a controlling TTY attached.
+                pass
+
         try:
             self._set_winsize(slave_fd, cols=cols, rows=rows)
             proc = subprocess.Popen(
@@ -42,7 +51,7 @@ class PtyShellSession:
                 stdout=slave_fd,
                 stderr=slave_fd,
                 close_fds=True,
-                preexec_fn=os.setsid,
+                preexec_fn=_preexec,
             )
         except Exception as exc:
             os.close(master_fd)
