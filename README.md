@@ -51,6 +51,18 @@ sshc localhost
 Then type commands at the prompt.
 The first prompt is initialized from server handshake metadata as `user@host:cwd$`.
 
+Clipboard backend controls are available on both `sshc` and `sshcd`:
+
+```bash
+sshc localhost --clipboard-backend auto --clipboard-read-timeout 2 --clipboard-write-timeout 2
+sshcd --clipboard-backend auto --clipboard-read-timeout 2 --clipboard-write-timeout 2
+```
+
+`--clipboard-backend` choices: `auto`, `wayland`, `xclip`, `xsel`.
+In `auto` mode, session detection is used:
+- Wayland session: `wl-copy`/`wl-paste` only.
+- X11 session: prefer `xsel`, then `xclip`.
+
 ### Git transport (shared upstream)
 
 Initialize one upstream bare repo that both peers can access:
@@ -105,6 +117,9 @@ Each peer keeps its own local bare mirror and continuously fetches/pushes agains
 - No encryption, authentication, or login checks.
 - Command/response mode, not full TTY emulation.
 - Clipboard is shared with normal copy/paste, so user clipboard activity can interfere.
+- Clipboard tools (`wl-copy`/`wl-paste`, `xsel`, `xclip`) are native system executables.
+  If missing, use your distro package manager or Conda (`conda install -c conda-forge wl-clipboard xsel xclip`).
+  `pip` is not a reliable way to install these binaries.
 - Best-effort reliability via retries + de-duplication.
 - Git transport requires a local `git` executable.
 - Git transport requires both peers to have access to the same upstream bare repo URL/path.

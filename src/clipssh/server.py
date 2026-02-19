@@ -10,7 +10,7 @@ import threading
 import time
 from typing import Any
 
-from .clipboard import ClipboardBackend, ClipboardError, detect_backend
+from .clipboard import BACKEND_CHOICES, ClipboardBackend, ClipboardError, detect_backend
 from .protocol import Message, build_message, decode_message, encode_message
 from .session import EndpointState
 from .shell import ShellExecutionError, ShellSession, resolve_shell
@@ -289,6 +289,24 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sshcd", description="Clipboard SSH server daemon")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logs")
     parser.add_argument(
+        "--clipboard-backend",
+        choices=BACKEND_CHOICES,
+        default="auto",
+        help="Clipboard backend selection strategy",
+    )
+    parser.add_argument(
+        "--clipboard-read-timeout",
+        type=float,
+        default=2.0,
+        help="Clipboard read command timeout in seconds",
+    )
+    parser.add_argument(
+        "--clipboard-write-timeout",
+        type=float,
+        default=2.0,
+        help="Clipboard write command timeout in seconds",
+    )
+    parser.add_argument(
         "--shell",
         default="tcsh",
         help="Preferred shell executable name or path (default: tcsh)",
@@ -320,10 +338,17 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        backend = detect_backend()
+        backend = detect_backend(
+            backend_preference=args.clipboard_backend,
+            read_timeout=max(args.clipboard_read_timeout, 0.1),
+            write_timeout=max(args.clipboard_write_timeout, 0.1),
+        )
     except ClipboardError as exc:
         print(f"sshcd: {exc}", file=sys.stderr)
         return 2
+
+    if args.verbose:
+        print(f"[sshcd] selected clipboard backend={backend.name()}", file=sys.stderr)
 
     config = ServerConfig(
         poll_interval=max(args.poll_interval_ms / 1000.0, 0.01),
