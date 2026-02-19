@@ -6,6 +6,7 @@ import errno
 import os
 import select
 import subprocess
+from typing import Dict
 from typing import Protocol
 
 
@@ -24,6 +25,77 @@ class AudioDuplexIO(Protocol):
 
     def close(self) -> None:
         ...
+
+
+def _ffmpeg_format_capabilities(ffmpeg_bin: str) -> dict[str, tuple[bool, bool]]:
+    try:
+        result = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-formats"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise AudioIOError(f"ffmpeg executable not found: {ffmpeg_bin}") from exc
+    except Exception as exc:
+        raise AudioIOError(f"Failed to query ffmpeg formats: {exc}") from exc
+
+    if result.returncode != 0:
+        stderr = (result.stderr or "").strip()
+        raise AudioIOError(f"ffmpeg -formats failed: {stderr or 'unknown error'}")
+
+    caps: dict[str, tuple[bool, bool]] = {}
+    for raw in (result.stdout or "").splitlines():
+        line = raw.rstrip()
+        if len(line) < 6:
+            continue
+        if line.startswith("File formats:"):
+            continue
+        if not line.startswith(" "):
+            continue
+        flag_d = line[1] == "D"
+        flag_e = line[2] == "E"
+        if line[3] != " ":
+            continue
+        rest = line[4:].strip()
+        if not rest:
+            continue
+        token = rest.split()[0]
+        # token may contain comma-separated aliases.
+        for name in token.split(","):
+            if not name:
+                continue
+            prev = caps.get(name, (False, False))
+            caps[name] = (prev[0] or flag_d, prev[1] or flag_e)
+    return caps
+
+
+def _format_duplex_backends(caps: dict[str, tuple[bool, bool]]) -> str:
+    names = sorted(name for name, (can_in, can_out) in caps.items() if can_in and can_out)
+    return ", ".join(names) if names else "<none>"
+
+
+def resolve_audio_backend(ffmpeg_bin: str, requested_backend: str) -> str:
+    caps = _ffmpeg_format_capabilities(ffmpeg_bin)
+    requested = (requested_backend or "").strip().lower()
+
+    if requested in {"", "auto"}:
+        for candidate in ("pulse", "pipewire", "alsa", "jack", "sndio", "oss"):
+            can_in, can_out = caps.get(candidate, (False, False))
+            if can_in and can_out:
+                return candidate
+        raise AudioIOError(
+            "No duplex ffmpeg audio backend found. "
+            f"Available duplex backends: {_format_duplex_backends(caps)}"
+        )
+
+    can_in, can_out = caps.get(requested, (False, False))
+    if not can_in or not can_out:
+        raise AudioIOError(
+            f"ffmpeg backend '{requested_backend}' is not available for both input and output. "
+            f"Available duplex backends: {_format_duplex_backends(caps)}"
+        )
+    return requested
 
 
 def _build_ffmpeg_capture_cmd(
@@ -94,16 +166,17 @@ class FFmpegAudioDuplexIO:
     ) -> None:
         self.read_timeout = max(read_timeout, 0.0)
         self.write_timeout = max(write_timeout, 0.0)
+        self.backend = resolve_audio_backend(ffmpeg_bin, backend)
 
         capture_cmd = _build_ffmpeg_capture_cmd(
             ffmpeg_bin=ffmpeg_bin,
-            backend=backend,
+            backend=self.backend,
             input_device=input_device,
             sample_rate=sample_rate,
         )
         playback_cmd = _build_ffmpeg_playback_cmd(
             ffmpeg_bin=ffmpeg_bin,
-            backend=backend,
+            backend=self.backend,
             output_device=output_device,
             sample_rate=sample_rate,
         )

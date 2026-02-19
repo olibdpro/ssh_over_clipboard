@@ -8,7 +8,12 @@ import struct
 import sys
 import time
 
-from .audio_io_ffmpeg import AudioIOError, FFmpegAudioDuplexIO
+from .audio_io_ffmpeg import (
+    AudioIOError,
+    FFmpegAudioDuplexIO,
+    _ffmpeg_format_capabilities,
+    _format_duplex_backends,
+)
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -20,8 +25,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tx", action="store_true", help="Emit probe tone to playback path")
     parser.add_argument("--rx", action="store_true", help="Capture and report input RMS/peak")
     parser.add_argument("--tone-hz", type=float, default=1040.0, help="Probe tone frequency")
-    parser.add_argument("--audio-backend", default="pulse", help="FFmpeg input/output backend")
+    parser.add_argument(
+        "--audio-backend",
+        default="auto",
+        help="FFmpeg input/output backend (default: auto-detect)",
+    )
     parser.add_argument("--ffmpeg-bin", default="ffmpeg", help="ffmpeg executable")
+    parser.add_argument(
+        "--list-backends",
+        action="store_true",
+        help="List detected ffmpeg duplex audio backends and exit",
+    )
     return parser
 
 
@@ -41,6 +55,15 @@ def _tone_chunk(*, sample_rate: int, frequency_hz: float, frames: int, phase0: f
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.list_backends:
+        try:
+            caps = _ffmpeg_format_capabilities(args.ffmpeg_bin)
+        except AudioIOError as exc:
+            print(f"sshg-audio-probe: {exc}", file=sys.stderr)
+            return 2
+        print(f"Available duplex backends: {_format_duplex_backends(caps)}")
+        return 0
 
     do_tx = args.tx or (not args.tx and not args.rx)
     do_rx = args.rx or (not args.tx and not args.rx)

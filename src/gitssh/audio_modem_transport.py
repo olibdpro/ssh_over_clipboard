@@ -40,7 +40,7 @@ class AudioModemTransportConfig:
     byte_repeat: int = 3
     marker_run: int = 16
     ffmpeg_bin: str = "ffmpeg"
-    audio_backend: str = "pulse"
+    audio_backend: str = "auto"
     verbose: bool = False
     io_factory: Callable[["AudioModemTransportConfig"], AudioDuplexIO] | None = None
 
@@ -277,4 +277,3 @@ class AudioModemTransportBackend:
             payload_crc,
         )
         return header + payload
-
