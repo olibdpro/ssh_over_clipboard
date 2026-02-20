@@ -25,6 +25,7 @@ from .git_transport import (
     GitTransportBackend,
 )
 from .audio_device_discovery import AudioDiscoveryConfig, discover_audio_devices
+from .audio_device_names import AudioDeviceNameError, resolve_input_device_name, resolve_output_device_name
 from .audio_io_ffmpeg import AudioIOError
 from .audio_modem_transport import AudioModemTransportBackend, AudioModemTransportConfig
 from .protocol import Message, build_message
@@ -578,12 +579,20 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--audio-input-device",
         default=None,
-        help="Input capture device for --transport audio-modem (Pulse/PipeWire name). Omit with output to auto-discover.",
+        help=(
+            "Input capture device (role alias or concrete backend device name). "
+            "Role aliases are backend-agnostic and resolved via --audio-backend. "
+            "Omit with output to auto-discover."
+        ),
     )
     parser.add_argument(
         "--audio-output-device",
         default=None,
-        help="Output playback device for --transport audio-modem (Pulse/PipeWire name). Omit with input to auto-discover.",
+        help=(
+            "Output playback device (role alias or concrete backend device name). "
+            "Role aliases are backend-agnostic and resolved via --audio-backend. "
+            "Omit with input to auto-discover."
+        ),
     )
     parser.add_argument(
         "--audio-sample-rate",
@@ -786,6 +795,20 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
                 f"--audio-modulation {shlex.quote(selected_modulation)}",
                 file=sys.stderr,
             )
+        else:
+            assert input_device is not None
+            assert output_device is not None
+            try:
+                input_device = resolve_input_device_name(
+                    requested=input_device,
+                    backend=args.audio_backend,
+                )
+                output_device = resolve_output_device_name(
+                    requested=output_device,
+                    backend=args.audio_backend,
+                )
+            except AudioDeviceNameError as exc:
+                raise TransportError(str(exc)) from exc
 
         assert input_device is not None
         assert output_device is not None

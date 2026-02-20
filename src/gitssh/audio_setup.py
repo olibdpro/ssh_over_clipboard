@@ -9,6 +9,15 @@ import subprocess
 import sys
 from typing import Any
 
+from .audio_device_names import (
+    CLIENT_INPUT_BASE,
+    CLIENT_OUTPUT_BASE,
+    PULSE_SUFFIX,
+    SERVER_INPUT_BASE,
+    SERVER_OUTPUT_BASE,
+    is_managed_pulse_device_name,
+)
+
 
 class AudioSetupError(RuntimeError):
     """Raised when audio setup operations fail."""
@@ -70,11 +79,14 @@ def _append_module_state(state: dict[str, Any], *, role: str, module_id: int, mo
 def create_client_devices() -> None:
     state = _read_state()
 
+    input_sink_name = f"{CLIENT_INPUT_BASE}{PULSE_SUFFIX}"
+    output_sink_name = f"{CLIENT_OUTPUT_BASE}{PULSE_SUFFIX}"
+
     rx_sink = _load_module(
         "module-null-sink",
         [
-            "sink_name=sshg_rx_sink",
-            "sink_properties=device.description=sshg_rx_sink",
+            f"sink_name={input_sink_name}",
+            f"sink_properties=device.description={input_sink_name}",
         ],
     )
     _append_module_state(state, role="client", module_id=rx_sink, module_name="module-null-sink")
@@ -82,55 +94,48 @@ def create_client_devices() -> None:
     tx_sink = _load_module(
         "module-null-sink",
         [
-            "sink_name=sshg_tx_sink",
-            "sink_properties=device.description=sshg_tx_sink",
+            f"sink_name={output_sink_name}",
+            f"sink_properties=device.description={output_sink_name}",
         ],
     )
     _append_module_state(state, role="client", module_id=tx_sink, module_name="module-null-sink")
 
-    tx_mic = _load_module(
-        "module-remap-source",
-        [
-            "source_name=sshg_tx_mic",
-            "master=sshg_tx_sink.monitor",
-            "source_properties=device.description=sshg_tx_mic",
-        ],
-    )
-    _append_module_state(state, role="client", module_id=tx_mic, module_name="module-remap-source")
-
     _write_state(state)
     print("Created client audio devices:")
-    print("- sink: sshg_rx_sink")
-    print("- sink: sshg_tx_sink")
-    print("- source: sshg_tx_mic (monitor of sshg_tx_sink)")
+    print(f"- sink: {input_sink_name}")
+    print(f"- sink: {output_sink_name}")
+    print(f"- source: {input_sink_name}.monitor (auto monitor source)")
 
 
 def create_server_devices() -> None:
     state = _read_state()
 
+    input_sink_name = f"{SERVER_INPUT_BASE}{PULSE_SUFFIX}"
+    output_sink_name = f"{SERVER_OUTPUT_BASE}{PULSE_SUFFIX}"
+
     vm_sink = _load_module(
         "module-null-sink",
         [
-            "sink_name=sshg_vm_sink",
-            "sink_properties=device.description=sshg_vm_sink",
+            f"sink_name={input_sink_name}",
+            f"sink_properties=device.description={input_sink_name}",
         ],
     )
     _append_module_state(state, role="server", module_id=vm_sink, module_name="module-null-sink")
 
-    vm_mic = _load_module(
-        "module-remap-source",
+    server_sink = _load_module(
+        "module-null-sink",
         [
-            "source_name=sshg_vm_mic",
-            "master=sshg_vm_sink.monitor",
-            "source_properties=device.description=sshg_vm_mic",
+            f"sink_name={output_sink_name}",
+            f"sink_properties=device.description={output_sink_name}",
         ],
     )
-    _append_module_state(state, role="server", module_id=vm_mic, module_name="module-remap-source")
+    _append_module_state(state, role="server", module_id=server_sink, module_name="module-null-sink")
 
     _write_state(state)
     print("Created server audio devices:")
-    print("- sink: sshg_vm_sink")
-    print("- source: sshg_vm_mic (monitor of sshg_vm_sink)")
+    print(f"- sink: {input_sink_name}")
+    print(f"- sink: {output_sink_name}")
+    print(f"- source: {input_sink_name}.monitor (auto monitor source)")
 
 
 def destroy_devices() -> None:
@@ -186,12 +191,19 @@ def status() -> None:
 
     print("\nMatching sinks:")
     for line in sinks.splitlines():
-        if "sshg_" in line:
+        if _is_managed_pulse_line(line):
             print(f"- {line}")
     print("\nMatching sources:")
     for line in sources.splitlines():
-        if "sshg_" in line:
+        if _is_managed_pulse_line(line):
             print(f"- {line}")
+
+
+def _is_managed_pulse_line(line: str) -> bool:
+    fields = line.split()
+    if len(fields) < 2:
+        return False
+    return is_managed_pulse_device_name(fields[1])
 
 
 def _build_parser() -> argparse.ArgumentParser:

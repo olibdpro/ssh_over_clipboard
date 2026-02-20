@@ -54,9 +54,9 @@ class GitClientCliTests(unittest.TestCase):
                 "--transport",
                 "audio-modem",
                 "--audio-input-device",
-                "sshg_rx_sink.monitor",
+                "server_output_receiver",
                 "--audio-output-device",
-                "sshg_tx_sink",
+                "client_response_sender",
                 "--audio-sample-rate",
                 "44100",
                 "--audio-byte-repeat",
@@ -76,8 +76,8 @@ class GitClientCliTests(unittest.TestCase):
             ]
         )
         self.assertEqual(args.transport, "audio-modem")
-        self.assertEqual(args.audio_input_device, "sshg_rx_sink.monitor")
-        self.assertEqual(args.audio_output_device, "sshg_tx_sink")
+        self.assertEqual(args.audio_input_device, "server_output_receiver")
+        self.assertEqual(args.audio_output_device, "client_response_sender")
         self.assertEqual(args.audio_sample_rate, 44100)
         self.assertEqual(args.audio_byte_repeat, 5)
         self.assertEqual(args.audio_modulation, "robust-v1")
@@ -127,9 +127,9 @@ class GitServerCliTests(unittest.TestCase):
                 "--transport",
                 "audio-modem",
                 "--audio-input-device",
-                "sshg_vm_mic",
+                "client_output_receiver",
                 "--audio-output-device",
-                "sshg_vm_sink",
+                "server_response_sender",
                 "--audio-marker-run",
                 "24",
                 "--audio-modulation",
@@ -147,8 +147,8 @@ class GitServerCliTests(unittest.TestCase):
             ]
         )
         self.assertEqual(args.transport, "audio-modem")
-        self.assertEqual(args.audio_input_device, "sshg_vm_mic")
-        self.assertEqual(args.audio_output_device, "sshg_vm_sink")
+        self.assertEqual(args.audio_input_device, "client_output_receiver")
+        self.assertEqual(args.audio_output_device, "server_response_sender")
         self.assertEqual(args.audio_marker_run, 24)
         self.assertEqual(args.audio_modulation, "legacy")
         self.assertEqual(args.audio_discovery_timeout, 35.0)

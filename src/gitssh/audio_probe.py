@@ -8,6 +8,11 @@ import struct
 import sys
 import time
 
+from .audio_device_names import (
+    AudioDeviceNameError,
+    resolve_input_device_name,
+    resolve_output_device_name,
+)
 from .audio_io_ffmpeg import (
     AudioIOError,
     _ffmpeg_format_capabilities,
@@ -18,8 +23,16 @@ from .audio_io_ffmpeg import (
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sshg-audio-probe", description="Probe ffmpeg audio capture/playback paths")
-    parser.add_argument("--input-device", default="default", help="Capture device name")
-    parser.add_argument("--output-device", default="default", help="Playback device name")
+    parser.add_argument(
+        "--input-device",
+        default="default",
+        help="Capture device name (role alias or concrete backend device name)",
+    )
+    parser.add_argument(
+        "--output-device",
+        default="default",
+        help="Playback device name (role alias or concrete backend device name)",
+    )
     parser.add_argument("--sample-rate", type=int, default=48000, help="PCM sample rate")
     parser.add_argument("--duration", type=float, default=5.0, help="Probe duration in seconds")
     parser.add_argument("--tx", action="store_true", help="Emit probe tone to playback path")
@@ -69,11 +82,24 @@ def main(argv: list[str] | None = None) -> int:
     do_rx = args.rx or (not args.tx and not args.rx)
 
     try:
+        resolved_input = resolve_input_device_name(
+            requested=args.input_device,
+            backend=args.audio_backend,
+        )
+        resolved_output = resolve_output_device_name(
+            requested=args.output_device,
+            backend=args.audio_backend,
+        )
+    except AudioDeviceNameError as exc:
+        print(f"sshg-audio-probe: {exc}", file=sys.stderr)
+        return 2
+
+    try:
         io_obj = build_audio_duplex_io(
             ffmpeg_bin=args.ffmpeg_bin,
             backend=args.audio_backend,
-            input_device=args.input_device,
-            output_device=args.output_device,
+            input_device=resolved_input,
+            output_device=resolved_output,
             sample_rate=max(args.sample_rate, 8000),
             read_timeout=0.01,
             write_timeout=0.1,

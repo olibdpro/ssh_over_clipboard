@@ -173,26 +173,48 @@ sshg-audio-probe --duration 5 --tx --rx
 sshg-audio-probe --list-backends
 ```
 
-Probe explicit virtual devices created by `sshg-audio-setup`:
+Naming rules for fixed routing:
+- Canonical role names: `server_output_receiver`, `client_response_sender`, `client_output_receiver`, `server_response_sender`.
+- Pass role aliases without suffix in CLI flags. `--audio-backend` resolves to concrete names (`*_pulse` or `*_alsa`).
+- For Pulse backends (`pulse-cli`, `pulse`, `pipewire`, `auto`), input aliases resolve to `<alias>_pulse.monitor` automatically.
+- `sshg-audio-setup` provisions Pulse sinks only; ALSA names are treated as literal ALSA PCM identifiers.
+
+Probe explicit client-side Pulse devices created by `sshg-audio-setup`:
 
 ```bash
 sshg-audio-probe --tx --rx --duration 5 \
-  --input-device sshg_vm_mic \
-  --output-device sshg_vm_sink
+  --audio-backend pulse-cli \
+  --input-device server_output_receiver \
+  --output-device client_response_sender
+```
+
+Probe explicit server-side Pulse devices created by `sshg-audio-setup`:
+
+```bash
+sshg-audio-probe --tx --rx --duration 5 \
+  --audio-backend pulse-cli \
+  --input-device client_output_receiver \
+  --output-device server_response_sender
 ```
 
 Run server in VM:
 
 ```bash
 sshgd -v \
-  --transport audio-modem
+  --transport audio-modem \
+  --audio-backend pulse-cli \
+  --audio-input-device client_output_receiver \
+  --audio-output-device server_response_sender
 ```
 
 Run client on host:
 
 ```bash
 sshg localhost \
-  --transport audio-modem
+  --transport audio-modem \
+  --audio-backend pulse-cli \
+  --audio-input-device server_output_receiver \
+  --audio-output-device client_response_sender
 ```
 
 If `--audio-input-device` and `--audio-output-device` are both omitted, `sshg` and `sshgd` run an auto-discovery sequence:
@@ -209,6 +231,7 @@ Troubleshooting:
 - Run `pactl list short sources` / `pactl list short sinks` and select concrete device names.
 - Backend auto mode prefers `pulse-cli` (`parec`/`pacat`) and falls back to ffmpeg if pulse-cli is unavailable.
 - You can force a backend: `--audio-backend pulse-cli` or an ffmpeg format backend such as `--audio-backend alsa` (if available).
+- Legacy `sshg_*` audio device names are no longer accepted; use role aliases and let `--audio-backend` select concrete names.
 
 Useful reliability knobs:
 - `--audio-modulation` (`auto`, `robust-v1`, `legacy`; default `auto`)
