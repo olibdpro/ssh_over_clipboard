@@ -198,7 +198,7 @@ sshg localhost \
 If `--audio-input-device` and `--audio-output-device` are both omitted, `sshg` and `sshgd` run an auto-discovery sequence:
 - warns you to lower speaker volume,
 - asks for confirmation before probes start,
-- sends/listens discovery pings on all detected input/output device combinations in parallel,
+- sends/listens discovery pings on all detected input and output devices in parallel,
 - prints the selected `--audio-input-device` / `--audio-output-device` flags to reuse next time.
 - requires an interactive terminal for confirmation (non-interactive runs should pass both device flags explicitly).
 

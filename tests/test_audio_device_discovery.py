@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import Counter
 import pathlib
 import sys
 import threading
@@ -145,7 +144,7 @@ class AudioDeviceDiscoveryTests(unittest.TestCase):
         self.assertEqual(server.input_device, "s_in_good")
         self.assertEqual(server.output_device, "s_out_good")
 
-    def test_opens_full_input_output_matrix_for_discovery_channels(self) -> None:
+    def test_opens_parallel_writer_and_listener_channels_for_all_devices(self) -> None:
         config = AudioDiscoveryConfig(
             timeout=0.25,
             ping_interval=0.01,
@@ -168,19 +167,16 @@ class AudioDeviceDiscoveryTests(unittest.TestCase):
                 io_factory=io_factory,
             )
 
-        expected_pairs = {
+        expected_open_sequence = [
             ("in_a", "out_1"),
             ("in_a", "out_2"),
             ("in_a", "out_3"),
+            ("in_a", "out_1"),
             ("in_b", "out_1"),
-            ("in_b", "out_2"),
-            ("in_b", "out_3"),
-        }
-        counts = Counter(open_calls)
-        self.assertEqual(set(counts.keys()), expected_pairs)
-        self.assertEqual(sum(counts.values()), len(expected_pairs) * 2)
-        for pair in expected_pairs:
-            self.assertEqual(counts[pair], 2)
+        ]
+        self.assertEqual(open_calls, expected_open_sequence)
+        self.assertEqual({in_dev for in_dev, _out_dev in open_calls}, {"in_a", "in_b"})
+        self.assertEqual({out_dev for _in_dev, out_dev in open_calls}, {"out_1", "out_2", "out_3"})
 
     def test_discovers_when_some_matrix_channels_fail_to_open(self) -> None:
         routes = {
