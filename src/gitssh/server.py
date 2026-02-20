@@ -644,6 +644,36 @@ def _build_parser() -> argparse.ArgumentParser:
         help="ffmpeg executable path for --transport audio-modem",
     )
     parser.add_argument(
+        "--audio-discovery-timeout",
+        type=float,
+        default=90.0,
+        help="Maximum seconds to wait for audio device auto-discovery",
+    )
+    parser.add_argument(
+        "--audio-discovery-ping-interval-ms",
+        type=int,
+        default=120,
+        help="Milliseconds between discovery ping probes per output device",
+    )
+    parser.add_argument(
+        "--audio-discovery-found-interval-ms",
+        type=int,
+        default=120,
+        help="Milliseconds between discovery found-confirmation retransmits",
+    )
+    parser.add_argument(
+        "--audio-discovery-candidate-grace",
+        type=float,
+        default=20.0,
+        help="Extra seconds to wait for final discovery acknowledgement after selecting a candidate pair",
+    )
+    parser.add_argument(
+        "--audio-discovery-max-silent-seconds",
+        type=float,
+        default=10.0,
+        help="Seconds before pending discovery ping nonces are considered stale",
+    )
+    parser.add_argument(
         "--shell",
         default="tcsh",
         help="Preferred shell executable name or path (default: tcsh)",
@@ -725,6 +755,11 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
                         sample_rate=max(args.audio_sample_rate, 8000),
                         read_timeout=max(args.audio_read_timeout_ms / 1000.0, 0.0),
                         write_timeout=max(args.audio_write_timeout_ms / 1000.0, 0.001),
+                        ping_interval=max(args.audio_discovery_ping_interval_ms / 1000.0, 0.01),
+                        found_interval=max(args.audio_discovery_found_interval_ms / 1000.0, 0.01),
+                        timeout=max(args.audio_discovery_timeout, 1.0),
+                        candidate_grace=max(args.audio_discovery_candidate_grace, 0.0),
+                        max_silent_seconds=max(args.audio_discovery_max_silent_seconds, 1.0),
                         byte_repeat=max(args.audio_byte_repeat, 1),
                         marker_run=max(args.audio_marker_run, 4),
                     ),

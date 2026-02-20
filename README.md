@@ -214,6 +214,12 @@ Useful reliability knobs:
 - `--audio-byte-repeat` (simple error-correction repeat factor, default `3`)
 - `--audio-ack-timeout-ms` / `--audio-max-retries`
 - `--audio-marker-run` (frame delimiter marker length)
+- Auto-discovery tuning:
+  - `--audio-discovery-timeout`
+  - `--audio-discovery-ping-interval-ms`
+  - `--audio-discovery-found-interval-ms`
+  - `--audio-discovery-candidate-grace`
+  - `--audio-discovery-max-silent-seconds`
 
 ## Protocol Notes
 
