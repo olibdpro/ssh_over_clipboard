@@ -237,7 +237,7 @@ def discover_audio_devices(
             ttl = max(config.timeout * 0.5, 5.0)
             cutoff = now - ttl
             for nonce in [n for n, (_output, ts) in pending_pings.items() if ts < cutoff]:
-                pending_pings.pop(n, None)
+                pending_pings.pop(nonce, None)
 
             time.sleep(max(config.idle_sleep, 0.0))
 

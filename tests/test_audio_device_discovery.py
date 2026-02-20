@@ -4,6 +4,7 @@ import pathlib
 import sys
 import threading
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -11,7 +12,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from gitssh.audio_device_discovery import AudioDiscoveryConfig, DiscoveredAudioDevices, discover_audio_devices
-from gitssh.audio_io_ffmpeg import AudioDuplexIO
+from gitssh.audio_io_ffmpeg import AudioDuplexIO, AudioIOError
 
 
 class _FakeAudioNetwork:
@@ -60,6 +61,18 @@ class _FakeDuplexIO(AudioDuplexIO):
 
     def close(self) -> None:
         self._closed = True
+
+
+class _NoTrafficDuplexIO(AudioDuplexIO):
+    def read(self, max_bytes: int) -> bytes:
+        del max_bytes
+        return b""
+
+    def write(self, data: bytes) -> None:
+        del data
+
+    def close(self) -> None:
+        return
 
 
 class AudioDeviceDiscoveryTests(unittest.TestCase):
@@ -129,6 +142,31 @@ class AudioDeviceDiscoveryTests(unittest.TestCase):
         self.assertEqual(client.output_device, "c_out_good")
         self.assertEqual(server.input_device, "s_in_good")
         self.assertEqual(server.output_device, "s_out_good")
+
+    def test_prunes_old_pending_pings_without_crashing(self) -> None:
+        config = AudioDiscoveryConfig(
+            timeout=20.0,
+            ping_interval=0.01,
+            idle_sleep=0.0,
+        )
+
+        ticks = {"now": 0.0}
+
+        def fake_monotonic() -> float:
+            ticks["now"] += 1.0
+            return ticks["now"]
+
+        with (
+            mock.patch("gitssh.audio_device_discovery.time.monotonic", side_effect=fake_monotonic),
+            mock.patch("gitssh.audio_device_discovery.time.sleep", return_value=None),
+        ):
+            with self.assertRaises(AudioIOError):
+                discover_audio_devices(
+                    config,
+                    input_devices=["only_in"],
+                    output_devices=["only_out"],
+                    io_factory=lambda _in_dev, _out_dev: _NoTrafficDuplexIO(),
+                )
 
 
 if __name__ == "__main__":
