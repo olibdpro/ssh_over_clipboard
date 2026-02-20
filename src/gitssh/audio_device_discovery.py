@@ -45,8 +45,8 @@ class DiscoveredAudioDevices:
 
 @dataclass
 class _WriterChannel:
+    input_device: str
     output_device: str
-    anchor_input_device: str
     io_obj: AudioDuplexIO
     codec: AudioFrameCodec
     next_ping_at: float = 0.0
@@ -56,7 +56,7 @@ class _WriterChannel:
 @dataclass
 class _ListenerChannel:
     input_device: str
-    anchor_output_device: str
+    output_device: str
     io_obj: AudioDuplexIO
     codec: AudioFrameCodec
     last_activity: float = 0.0
@@ -117,9 +117,10 @@ def discover_audio_devices(
         raise AudioIOError("Audio discovery found no output devices.")
 
     log = logger if logger is not None else (lambda _text: None)
+    pair_count = len(input_devices) * len(output_devices)
     log(
         "audio discovery starting with "
-        f"{len(input_devices)} input(s) and {len(output_devices)} output(s) "
+        f"{len(input_devices)} input(s), {len(output_devices)} output(s), {pair_count} pair(s) "
         f"(timeout={max(config.timeout, 1.0):.1f}s, ping_interval={max(config.ping_interval, 0.01):.3f}s)"
     )
 
@@ -140,14 +141,18 @@ def discover_audio_devices(
         io_factory=io_factory,
         open_errors=open_errors,
     )
+    log(
+        "audio discovery channels opened: "
+        f"writer_pairs={len(writers)}/{pair_count}, listener_pairs={len(listeners)}/{pair_count}"
+    )
 
     try:
         if not writers:
             details = "\n".join(f"- {line}" for line in open_errors) if open_errors else "- unknown error"
-            raise AudioIOError(f"Audio discovery could not open any output device:\n{details}")
+            raise AudioIOError(f"Audio discovery could not open any writer channel:\n{details}")
         if not listeners:
             details = "\n".join(f"- {line}" for line in open_errors) if open_errors else "- unknown error"
-            raise AudioIOError(f"Audio discovery could not open any input device:\n{details}")
+            raise AudioIOError(f"Audio discovery could not open any listener channel:\n{details}")
 
         local_id = uuid.uuid4().hex
         pending_pings: dict[str, tuple[str, float]] = {}
@@ -168,7 +173,7 @@ def discover_audio_devices(
             writers.remove(channel)
             _safe_close(channel.io_obj)
             detail = (
-                f"output '{channel.output_device}' (anchor input '{channel.anchor_input_device}') "
+                f"writer pair in='{channel.input_device}' out='{channel.output_device}' "
                 f"disabled: {reason}"
             )
             disabled_channels.append(detail)
@@ -180,7 +185,7 @@ def discover_audio_devices(
             listeners.remove(channel)
             _safe_close(channel.io_obj)
             detail = (
-                f"input '{channel.input_device}' (anchor output '{channel.anchor_output_device}') "
+                f"listener pair in='{channel.input_device}' out='{channel.output_device}' "
                 f"disabled: {reason}"
             )
             disabled_channels.append(detail)
@@ -303,7 +308,7 @@ def discover_audio_devices(
                 last_progress_log = now
                 log(
                     "audio discovery progress: "
-                    f"active_inputs={len(listeners)} active_outputs={len(writers)} "
+                    f"active_listener_pairs={len(listeners)} active_writer_pairs={len(writers)} "
                     f"pings_sent={stats.pings_sent} pongs_rx={stats.pongs_rx} "
                     f"found_sent={stats.found_sent} found_ack_rx={stats.found_ack_rx} "
                     f"pending_pings={len(pending_pings)}"
@@ -461,51 +466,32 @@ def _create_writer_channels(
     open_errors: list[str],
 ) -> list[_WriterChannel]:
     channels: list[_WriterChannel] = []
-    for output_device in output_devices:
-        channel = _try_open_writer_channel(
-            config=config,
-            input_devices=input_devices,
-            output_device=output_device,
-            io_factory=io_factory,
-            open_errors=open_errors,
-        )
-        if channel is not None:
-            channels.append(channel)
+    for input_device in input_devices:
+        for output_device in output_devices:
+            try:
+                io_obj = _open_discovery_io(
+                    config=config,
+                    input_device=input_device,
+                    output_device=output_device,
+                    io_factory=io_factory,
+                )
+            except AudioIOError as exc:
+                open_errors.append(
+                    f"writer pair in='{input_device}' out='{output_device}' failed: {exc}"
+                )
+                continue
+
+            channels.append(
+                _WriterChannel(
+                    input_device=input_device,
+                    output_device=output_device,
+                    io_obj=io_obj,
+                    codec=_build_codec(config),
+                    next_ping_at=0.0,
+                    last_activity=time.monotonic(),
+                )
+            )
     return channels
-
-
-def _try_open_writer_channel(
-    *,
-    config: AudioDiscoveryConfig,
-    input_devices: list[str],
-    output_device: str,
-    io_factory: Callable[[str, str], AudioDuplexIO] | None,
-    open_errors: list[str],
-) -> _WriterChannel | None:
-    for anchor_input in input_devices:
-        try:
-            io_obj = _open_discovery_io(
-                config=config,
-                input_device=anchor_input,
-                output_device=output_device,
-                io_factory=io_factory,
-            )
-        except AudioIOError as exc:
-            open_errors.append(
-                f"output '{output_device}' via input anchor '{anchor_input}' failed: {exc}"
-            )
-            continue
-
-        return _WriterChannel(
-            output_device=output_device,
-            anchor_input_device=anchor_input,
-            io_obj=io_obj,
-            codec=_build_codec(config),
-            next_ping_at=0.0,
-            last_activity=time.monotonic(),
-        )
-
-    return None
 
 
 def _create_listener_channels(
@@ -518,49 +504,30 @@ def _create_listener_channels(
 ) -> list[_ListenerChannel]:
     channels: list[_ListenerChannel] = []
     for input_device in input_devices:
-        channel = _try_open_listener_channel(
-            config=config,
-            input_device=input_device,
-            output_devices=output_devices,
-            io_factory=io_factory,
-            open_errors=open_errors,
-        )
-        if channel is not None:
-            channels.append(channel)
+        for output_device in output_devices:
+            try:
+                io_obj = _open_discovery_io(
+                    config=config,
+                    input_device=input_device,
+                    output_device=output_device,
+                    io_factory=io_factory,
+                )
+            except AudioIOError as exc:
+                open_errors.append(
+                    f"listener pair in='{input_device}' out='{output_device}' failed: {exc}"
+                )
+                continue
+
+            channels.append(
+                _ListenerChannel(
+                    input_device=input_device,
+                    output_device=output_device,
+                    io_obj=io_obj,
+                    codec=_build_codec(config),
+                    last_activity=time.monotonic(),
+                )
+            )
     return channels
-
-
-def _try_open_listener_channel(
-    *,
-    config: AudioDiscoveryConfig,
-    input_device: str,
-    output_devices: list[str],
-    io_factory: Callable[[str, str], AudioDuplexIO] | None,
-    open_errors: list[str],
-) -> _ListenerChannel | None:
-    for anchor_output in output_devices:
-        try:
-            io_obj = _open_discovery_io(
-                config=config,
-                input_device=input_device,
-                output_device=anchor_output,
-                io_factory=io_factory,
-            )
-        except AudioIOError as exc:
-            open_errors.append(
-                f"input '{input_device}' via output anchor '{anchor_output}' failed: {exc}"
-            )
-            continue
-
-        return _ListenerChannel(
-            input_device=input_device,
-            anchor_output_device=anchor_output,
-            io_obj=io_obj,
-            codec=_build_codec(config),
-            last_activity=time.monotonic(),
-        )
-
-    return None
 
 
 def _format_timeout_error(
@@ -586,7 +553,7 @@ def _format_timeout_error(
         f"pings_sent={stats.pings_sent}, pongs_rx={stats.pongs_rx}, "
         f"found_sent={stats.found_sent}, found_rx={stats.found_rx}, "
         f"found_ack_rx={stats.found_ack_rx}, frames_rx={stats.frames_rx}",
-        f"Active channels at timeout: inputs={len(listeners)}, outputs={len(writers)}",
+        f"Active channels at timeout: listener_pairs={len(listeners)}, writer_pairs={len(writers)}",
         f"Pending pings at timeout: {len(pending_pings)}",
     ]
 

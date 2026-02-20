@@ -790,7 +790,7 @@ def _normalize_audio_device_arg(value: str | None) -> str | None:
 
 def _confirm_audio_discovery(program: str) -> None:
     print(
-        f"{program}: audio auto-discovery will send probe tones on all detected output devices.",
+        f"{program}: audio auto-discovery will send probe tones across all detected input/output device combinations.",
         file=sys.stderr,
     )
     print(
