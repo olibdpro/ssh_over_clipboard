@@ -634,6 +634,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Number of marker samples used to delimit audio frames",
     )
     parser.add_argument(
+        "--audio-modulation",
+        default="auto",
+        choices=["auto", "legacy", "robust-v1"],
+        help="Audio modulation profile for --transport audio-modem",
+    )
+    parser.add_argument(
         "--audio-backend",
         default="auto",
         help="Audio backend for --transport audio-modem (auto, pulse-cli, or ffmpeg format name)",
@@ -735,6 +741,7 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
     if args.transport == "audio-modem":
         input_device = _normalize_audio_device_arg(args.audio_input_device)
         output_device = _normalize_audio_device_arg(args.audio_output_device)
+        selected_modulation = args.audio_modulation
 
         if (input_device is None) != (output_device is None):
             raise TransportError(
@@ -762,6 +769,7 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
                         max_silent_seconds=max(args.audio_discovery_max_silent_seconds, 1.0),
                         byte_repeat=max(args.audio_byte_repeat, 1),
                         marker_run=max(args.audio_marker_run, 4),
+                        audio_modulation=args.audio_modulation,
                     ),
                     logger=discovery_logger,
                 )
@@ -770,10 +778,12 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
 
             input_device = discovered.input_device
             output_device = discovered.output_device
+            selected_modulation = discovered.modulation
             print(
                 "sshgd: auto-selected audio devices. Reuse with: "
                 f"--audio-input-device {shlex.quote(input_device)} "
-                f"--audio-output-device {shlex.quote(output_device)}",
+                f"--audio-output-device {shlex.quote(output_device)} "
+                f"--audio-modulation {shlex.quote(selected_modulation)}",
                 file=sys.stderr,
             )
 
@@ -791,6 +801,7 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
                 max_retries=max(args.audio_max_retries, 1),
                 byte_repeat=max(args.audio_byte_repeat, 1),
                 marker_run=max(args.audio_marker_run, 4),
+                audio_modulation=selected_modulation,
                 ffmpeg_bin=args.audio_ffmpeg_bin,
                 audio_backend=args.audio_backend,
                 verbose=args.verbose,

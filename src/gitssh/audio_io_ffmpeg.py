@@ -474,6 +474,7 @@ class PulseCliAudioDuplexIO:
             "--channels=1",
             f"--rate={sample_rate}",
             "--format=s16le",
+            "--latency-msec=30",
             f"--device={resolved_input}",
         ]
         playback_cmd = [
@@ -483,6 +484,7 @@ class PulseCliAudioDuplexIO:
             "--channels=1",
             f"--rate={sample_rate}",
             "--format=s16le",
+            "--latency-msec=30",
             f"--device={resolved_output}",
         ]
 

@@ -5,13 +5,19 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass
 import struct
+import sys
 import threading
 import time
 from typing import Callable, Deque
 import zlib
 
 from .audio_io_ffmpeg import AudioDuplexIO, AudioIOError, build_audio_duplex_io
-from .audio_modem import AudioFrameCodec
+from .audio_modem import (
+    MODULATION_ROBUST_V1,
+    AudioModulationCodec,
+    create_audio_frame_codec,
+    normalize_audio_modulation,
+)
 from .protocol import Message, decode_message, encode_message
 from .transport import TransportError
 
@@ -39,6 +45,7 @@ class AudioModemTransportConfig:
     seen_seq_window: int = 4096
     byte_repeat: int = 3
     marker_run: int = 16
+    audio_modulation: str = "auto"
     ffmpeg_bin: str = "ffmpeg"
     audio_backend: str = "auto"
     verbose: bool = False
@@ -66,10 +73,17 @@ class AudioModemTransportBackend:
     def __init__(self, config: AudioModemTransportConfig) -> None:
         self.config = config
         self._io: AudioDuplexIO | None = None
-        self._codec = AudioFrameCodec(
+        normalized_modulation = normalize_audio_modulation(config.audio_modulation, allow_auto=True)
+        self._effective_modulation = (
+            MODULATION_ROBUST_V1 if normalized_modulation == "auto" else normalized_modulation
+        )
+        self._codec: AudioModulationCodec = create_audio_frame_codec(
+            modulation=self._effective_modulation,
+            sample_rate=max(config.sample_rate, 8000),
             byte_repeat=max(config.byte_repeat, 1),
             marker_run=max(config.marker_run, 4),
         )
+        self._last_codec_log_at = 0.0
         self._lock = threading.RLock()
         self._closed = False
 
@@ -86,7 +100,7 @@ class AudioModemTransportBackend:
 
     def name(self) -> str:
         return (
-            f"audio-modem:{self.config.audio_backend}:"
+            f"audio-modem:{self.config.audio_backend}:{self._effective_modulation}:"
             f"in={self.config.input_device},out={self.config.output_device}"
         )
 
@@ -180,6 +194,8 @@ class AudioModemTransportBackend:
             for raw in self._codec.feed_pcm(pcm):
                 if raw:
                     self._handle_link_frame(raw)
+
+        self._maybe_log_codec_stats()
 
     def _enqueue_due_frames_locked(self, now: float) -> None:
         while self._ack_frames:
@@ -277,3 +293,23 @@ class AudioModemTransportBackend:
             payload_crc,
         )
         return header + payload
+
+    def _maybe_log_codec_stats(self) -> None:
+        if not self.config.verbose:
+            return
+
+        now = time.monotonic()
+        if (now - self._last_codec_log_at) < 2.0:
+            return
+
+        self._last_codec_log_at = now
+        stats = self._codec.snapshot_stats()
+        print(
+            "[audio-modem] "
+            f"modulation={self._effective_modulation} "
+            f"frames_decoded={stats.get('frames_decoded', 0)} "
+            f"sync_hits={stats.get('sync_hits', 0)} "
+            f"crc_failures={stats.get('crc_failures', 0)} "
+            f"decode_failures={stats.get('decode_failures', 0)}",
+            file=sys.stderr,
+        )

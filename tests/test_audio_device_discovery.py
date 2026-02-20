@@ -90,6 +90,7 @@ class AudioDeviceDiscoveryTests(unittest.TestCase):
             timeout=3.0,
             ping_interval=0.02,
             idle_sleep=0.001,
+            audio_modulation="legacy",
         )
 
         results: dict[str, DiscoveredAudioDevices] = {}
@@ -151,6 +152,7 @@ class AudioDeviceDiscoveryTests(unittest.TestCase):
             found_interval=0.01,
             max_silent_seconds=0.2,
             idle_sleep=0.0,
+            audio_modulation="legacy",
         )
 
         open_calls: list[tuple[str, str]] = []
@@ -194,6 +196,7 @@ class AudioDeviceDiscoveryTests(unittest.TestCase):
             candidate_grace=1.0,
             max_silent_seconds=1.0,
             idle_sleep=0.001,
+            audio_modulation="legacy",
         )
 
         results: dict[str, DiscoveredAudioDevices] = {}
@@ -253,12 +256,13 @@ class AudioDeviceDiscoveryTests(unittest.TestCase):
         network = _FakeAudioNetwork(routes=routes)
 
         config = AudioDiscoveryConfig(
-            timeout=4.0,
+            timeout=6.0,
             ping_interval=0.02,
             found_interval=0.02,
-            candidate_grace=1.0,
+            candidate_grace=2.0,
             max_silent_seconds=1.0,
             idle_sleep=0.001,
+            audio_modulation="legacy",
         )
 
         results: dict[str, DiscoveredAudioDevices] = {}
@@ -324,6 +328,7 @@ class AudioDeviceDiscoveryTests(unittest.TestCase):
             candidate_grace=0.2,
             max_silent_seconds=0.5,
             idle_sleep=0.001,
+            audio_modulation="legacy",
         )
 
         errors: dict[str, Exception] = {}
@@ -383,6 +388,7 @@ class AudioDeviceDiscoveryTests(unittest.TestCase):
             found_interval=0.01,
             max_silent_seconds=1.0,
             idle_sleep=0.0,
+            audio_modulation="legacy",
         )
 
         ticks = {"now": 0.0}
@@ -402,6 +408,55 @@ class AudioDeviceDiscoveryTests(unittest.TestCase):
                     output_devices=["only_out"],
                     io_factory=lambda _in_dev, _out_dev: _NoTrafficDuplexIO(),
                 )
+
+    def test_caps_pending_pings_per_output(self) -> None:
+        config = AudioDiscoveryConfig(
+            timeout=0.25,
+            ping_interval=0.01,
+            found_interval=0.01,
+            max_silent_seconds=5.0,
+            idle_sleep=0.0,
+            max_pending_pings_per_output=1,
+            audio_modulation="legacy",
+        )
+
+        with self.assertRaises(AudioIOError) as ctx:
+            discover_audio_devices(
+                config,
+                input_devices=["in_a"],
+                output_devices=["out_1", "out_2"],
+                io_factory=lambda _in_dev, _out_dev: _NoTrafficDuplexIO(),
+            )
+
+        # Exactly one unacknowledged ping per output should be allowed.
+        self.assertIn("pings_sent=2", str(ctx.exception))
+
+    def test_auto_modulation_falls_back_to_legacy(self) -> None:
+        config = AudioDiscoveryConfig(
+            timeout=3.0,
+            ping_interval=0.02,
+            idle_sleep=0.001,
+            audio_modulation="auto",
+        )
+
+        with mock.patch(
+            "gitssh.audio_device_discovery._discover_audio_devices_once",
+            side_effect=[
+                AudioIOError("robust failed"),
+                DiscoveredAudioDevices(input_device="in_ok", output_device="out_ok", modulation="legacy"),
+            ],
+        ) as discover:
+            result = discover_audio_devices(
+                config,
+                input_devices=["in_ok"],
+                output_devices=["out_ok"],
+                io_factory=lambda _in_dev, _out_dev: _NoTrafficDuplexIO(),
+            )
+
+        self.assertEqual(result.modulation, "legacy")
+        self.assertEqual(discover.call_count, 2)
+        self.assertEqual(discover.call_args_list[0].kwargs["modulation"], "robust-v1")
+        self.assertEqual(discover.call_args_list[1].kwargs["modulation"], "legacy")
 
 
 if __name__ == "__main__":

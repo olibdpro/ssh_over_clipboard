@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import time
 from typing import Callable
 import uuid
 
 from .audio_io_ffmpeg import AudioDuplexIO, AudioIOError, _list_pulse_devices, build_audio_duplex_io
-from .audio_modem import AudioFrameCodec
+from .audio_modem import (
+    MODULATION_LEGACY,
+    MODULATION_ROBUST_V1,
+    AudioModulationCodec,
+    create_audio_frame_codec,
+    normalize_audio_modulation,
+)
 
 _PING_KIND = "ping"
 _PONG_KIND = "pong"
@@ -31,14 +37,17 @@ class AudioDiscoveryConfig:
     max_silent_seconds: float = 10.0
     progress_log_interval: float = 2.0
     idle_sleep: float = 0.01
+    max_pending_pings_per_output: int = 2
     byte_repeat: int = 3
     marker_run: int = 16
+    audio_modulation: str = "auto"
 
 
 @dataclass(frozen=True)
 class DiscoveredAudioDevices:
     input_device: str
     output_device: str
+    modulation: str = MODULATION_LEGACY
     peer_input_device: str | None = None
     peer_output_device: str | None = None
 
@@ -48,8 +57,9 @@ class _WriterChannel:
     input_device: str
     output_device: str
     io_obj: AudioDuplexIO
-    codec: AudioFrameCodec
+    codec: AudioModulationCodec
     next_ping_at: float = 0.0
+    next_tx_at: float = 0.0
     last_activity: float = 0.0
 
 
@@ -58,7 +68,7 @@ class _ListenerChannel:
     input_device: str
     output_device: str
     io_obj: AudioDuplexIO
-    codec: AudioFrameCodec
+    codec: AudioModulationCodec
     last_activity: float = 0.0
 
 
@@ -70,6 +80,10 @@ class _DiscoveryStats:
     found_rx: int = 0
     found_ack_rx: int = 0
     frames_rx: int = 0
+    codec_frames_decoded: int = 0
+    codec_crc_failures: int = 0
+    codec_sync_hits: int = 0
+    codec_decode_failures: int = 0
 
 
 @dataclass
@@ -81,6 +95,10 @@ class _ListenerEvent:
     found_rx: int = 0
     found_ack_rx: int = 0
     frames_rx: int = 0
+    codec_frames_decoded: int = 0
+    codec_crc_failures: int = 0
+    codec_sync_hits: int = 0
+    codec_decode_failures: int = 0
 
 
 def list_pulse_audio_devices() -> tuple[list[str], list[str]]:
@@ -117,9 +135,82 @@ def discover_audio_devices(
         raise AudioIOError("Audio discovery found no output devices.")
 
     log = logger if logger is not None else (lambda _text: None)
+    try:
+        requested_modulation = normalize_audio_modulation(config.audio_modulation, allow_auto=True)
+    except Exception as exc:
+        raise AudioIOError(f"Invalid audio modulation setting for discovery: {exc}") from exc
+    if requested_modulation != "auto":
+        return _discover_audio_devices_once(
+            config=config,
+            modulation=requested_modulation,
+            input_devices=input_devices,
+            output_devices=output_devices,
+            io_factory=io_factory,
+            logger=log,
+        )
+
+    total_timeout = max(config.timeout, 1.0)
+    robust_timeout = max(total_timeout * 0.7, 1.0)
+    legacy_timeout = max(total_timeout - robust_timeout, 1.0)
+
+    log(
+        "audio discovery auto modulation: "
+        f"trying {MODULATION_ROBUST_V1} for {robust_timeout:.1f}s, "
+        f"then {MODULATION_LEGACY} for {legacy_timeout:.1f}s if needed"
+    )
+
+    robust_config = replace(
+        config,
+        timeout=robust_timeout,
+        audio_modulation=MODULATION_ROBUST_V1,
+    )
+    try:
+        return _discover_audio_devices_once(
+            config=robust_config,
+            modulation=MODULATION_ROBUST_V1,
+            input_devices=input_devices,
+            output_devices=output_devices,
+            io_factory=io_factory,
+            logger=log,
+        )
+    except AudioIOError as robust_exc:
+        log(f"audio discovery robust-v1 failed; falling back to legacy: {robust_exc}")
+        legacy_config = replace(
+            config,
+            timeout=legacy_timeout,
+            audio_modulation=MODULATION_LEGACY,
+        )
+        try:
+            return _discover_audio_devices_once(
+                config=legacy_config,
+                modulation=MODULATION_LEGACY,
+                input_devices=input_devices,
+                output_devices=output_devices,
+                io_factory=io_factory,
+                logger=log,
+            )
+        except AudioIOError as legacy_exc:
+            raise AudioIOError(
+                "Audio discovery failed in both modulation modes.\n"
+                f"- {MODULATION_ROBUST_V1}: {robust_exc}\n"
+                f"- {MODULATION_LEGACY}: {legacy_exc}"
+            ) from legacy_exc
+
+
+def _discover_audio_devices_once(
+    *,
+    config: AudioDiscoveryConfig,
+    modulation: str,
+    input_devices: list[str],
+    output_devices: list[str],
+    io_factory: Callable[[str, str], AudioDuplexIO] | None,
+    logger: Callable[[str], None],
+) -> DiscoveredAudioDevices:
+    log = logger
     log(
         "audio discovery starting with "
-        f"{len(input_devices)} input(s), {len(output_devices)} output(s) "
+        f"{len(input_devices)} input(s), {len(output_devices)} output(s), "
+        f"modulation={modulation} "
         f"(timeout={max(config.timeout, 1.0):.1f}s, ping_interval={max(config.ping_interval, 0.01):.3f}s)"
     )
 
@@ -128,6 +219,7 @@ def discover_audio_devices(
 
     writers = _create_writer_channels(
         config=config,
+        modulation=modulation,
         input_devices=input_devices,
         output_devices=output_devices,
         io_factory=io_factory,
@@ -135,6 +227,7 @@ def discover_audio_devices(
     )
     listeners = _create_listener_channels(
         config=config,
+        modulation=modulation,
         input_devices=input_devices,
         output_devices=output_devices,
         io_factory=io_factory,
@@ -156,7 +249,7 @@ def discover_audio_devices(
             details = "\n".join(f"- {line}" for line in open_errors) if open_errors else "- unknown error"
             raise AudioIOError(f"Audio discovery could not open any listener channel:\n{details}")
 
-        local_id = uuid.uuid4().hex
+        local_id = uuid.uuid4().hex[:12]
         pending_pings: dict[str, tuple[str, float]] = {}
         stats = _DiscoveryStats()
         selected_devices: DiscoveredAudioDevices | None = None
@@ -215,27 +308,43 @@ def discover_audio_devices(
                     )
                 )
 
-            for writer in list(writers):
-                if now < writer.next_ping_at:
-                    continue
+            if selected_devices is None:
+                for writer in list(writers):
+                    if now < writer.next_ping_at:
+                        continue
+                    if now < writer.next_tx_at:
+                        continue
+                    if (
+                        _count_pending_for_output(pending_pings, writer.output_device)
+                        >= max(config.max_pending_pings_per_output, 1)
+                    ):
+                        continue
 
-                nonce = uuid.uuid4().hex
-                pending_pings[nonce] = (writer.output_device, now)
-                ping = {
-                    "kind": _PING_KIND,
-                    "sender": local_id,
-                    "nonce": nonce,
-                    "tx_device": writer.output_device,
-                }
+                    nonce = uuid.uuid4().hex[:16]
+                    ping = {
+                        "kind": _PING_KIND,
+                        "sender": local_id,
+                        "nonce": nonce,
+                        "modulation": modulation,
+                    }
 
-                send_error = _send_discovery_frame(writer, ping)
-                if send_error is not None:
-                    disable_writer(writer, send_error)
-                    continue
+                    sent, send_error = _send_discovery_frame(
+                        writer,
+                        ping,
+                        now=now,
+                        sample_rate=config.sample_rate,
+                        respect_backpressure=True,
+                    )
+                    if send_error is not None:
+                        disable_writer(writer, send_error)
+                        continue
+                    if not sent:
+                        continue
 
-                stats.pings_sent += 1
-                writer.last_activity = now
-                writer.next_ping_at = now + max(config.ping_interval, 0.01)
+                    pending_pings[nonce] = (writer.output_device, now)
+                    stats.pings_sent += 1
+                    writer.last_activity = now
+                    writer.next_ping_at = now + max(config.ping_interval, 0.01)
 
             if not writers:
                 raise AudioIOError("Audio discovery lost all usable output devices while probing.")
@@ -245,13 +354,20 @@ def discover_audio_devices(
                     "kind": _FOUND_KIND,
                     "sender": local_id,
                     "target": selected_peer_id,
-                    "tx_device": selected_devices.output_device,
-                    "rx_device": selected_devices.input_device,
+                    "modulation": modulation,
                 }
                 for writer in list(writers):
-                    send_error = _send_discovery_frame(writer, found)
+                    sent, send_error = _send_discovery_frame(
+                        writer,
+                        found,
+                        now=now,
+                        sample_rate=config.sample_rate,
+                        respect_backpressure=True,
+                    )
                     if send_error is not None:
                         disable_writer(writer, send_error)
+                        continue
+                    if not sent:
                         continue
                     stats.found_sent += 1
                     writer.last_activity = now
@@ -263,6 +379,8 @@ def discover_audio_devices(
                         listener=listener,
                         writers=writers,
                         local_id=local_id,
+                        modulation=modulation,
+                        sample_rate=config.sample_rate,
                         pending_pings=pending_pings,
                         selected_devices=selected_devices,
                         selected_peer_id=selected_peer_id,
@@ -277,6 +395,10 @@ def discover_audio_devices(
                 stats.pongs_rx += event.pongs_rx
                 stats.found_rx += event.found_rx
                 stats.found_ack_rx += event.found_ack_rx
+                stats.codec_frames_decoded += event.codec_frames_decoded
+                stats.codec_crc_failures += event.codec_crc_failures
+                stats.codec_sync_hits += event.codec_sync_hits
+                stats.codec_decode_failures += event.codec_decode_failures
 
                 if event.candidate is not None and selected_devices is None:
                     selected_devices = event.candidate
@@ -287,6 +409,7 @@ def discover_audio_devices(
                     log(
                         "audio discovery candidate selected: "
                         f"in={selected_devices.input_device}, out={selected_devices.output_device}, "
+                        f"modulation={selected_devices.modulation}, "
                         f"peer={selected_peer_id}"
                     )
 
@@ -313,7 +436,11 @@ def discover_audio_devices(
                     f"active_listeners={len(listeners)} active_writers={len(writers)} "
                     f"pings_sent={stats.pings_sent} pongs_rx={stats.pongs_rx} "
                     f"found_sent={stats.found_sent} found_ack_rx={stats.found_ack_rx} "
-                    f"pending_pings={len(pending_pings)}"
+                    f"pending_pings={len(pending_pings)} "
+                    f"codec_frames_decoded={stats.codec_frames_decoded} "
+                    f"codec_sync_hits={stats.codec_sync_hits} "
+                    f"codec_crc_failures={stats.codec_crc_failures} "
+                    f"pending_cap_per_output={max(config.max_pending_pings_per_output, 1)}"
                 )
 
             time.sleep(max(config.idle_sleep, 0.0))
@@ -329,6 +456,8 @@ def _read_and_process_listener(
     listener: _ListenerChannel,
     writers: list[_WriterChannel],
     local_id: str,
+    modulation: str,
+    sample_rate: int,
     pending_pings: dict[str, tuple[str, float]],
     selected_devices: DiscoveredAudioDevices | None,
     selected_peer_id: str | None,
@@ -336,6 +465,7 @@ def _read_and_process_listener(
     disable_writer: Callable[[_WriterChannel, str], None],
 ) -> _ListenerEvent:
     event = _ListenerEvent()
+    codec_before = _snapshot_codec_stats(listener.codec)
 
     for _ in range(8):
         try:
@@ -357,7 +487,16 @@ def _read_and_process_listener(
 
             kind = message.get("kind")
             sender = message.get("sender")
+            peer_modulation = message.get("modulation")
             if not isinstance(kind, str) or not isinstance(sender, str):
+                continue
+            if isinstance(peer_modulation, str):
+                normalized_peer_modulation = peer_modulation
+            elif modulation == MODULATION_LEGACY:
+                normalized_peer_modulation = MODULATION_LEGACY
+            else:
+                continue
+            if normalized_peer_modulation != modulation:
                 continue
             if sender == local_id:
                 continue
@@ -372,12 +511,19 @@ def _read_and_process_listener(
                         "sender": local_id,
                         "target": sender,
                         "echo_nonce": nonce,
-                        "tx_device": writer.output_device,
-                        "rx_device": listener.input_device,
+                        "modulation": modulation,
                     }
-                    send_error = _send_discovery_frame(writer, pong)
+                    sent, send_error = _send_discovery_frame(
+                        writer,
+                        pong,
+                        now=now,
+                        sample_rate=sample_rate,
+                        respect_backpressure=False,
+                    )
                     if send_error is not None:
                         disable_writer(writer, send_error)
+                        continue
+                    if not sent:
                         continue
                     writer.last_activity = now
                 continue
@@ -394,13 +540,20 @@ def _read_and_process_listener(
                     "kind": _FOUND_ACK_KIND,
                     "sender": local_id,
                     "target": sender,
-                    "tx_device": selected_devices.output_device,
-                    "rx_device": selected_devices.input_device,
+                    "modulation": modulation,
                 }
                 for writer in list(writers):
-                    send_error = _send_discovery_frame(writer, found_ack)
+                    sent, send_error = _send_discovery_frame(
+                        writer,
+                        found_ack,
+                        now=now,
+                        sample_rate=sample_rate,
+                        respect_backpressure=False,
+                    )
                     if send_error is not None:
                         disable_writer(writer, send_error)
+                        continue
+                    if not sent:
                         continue
                     writer.last_activity = now
                 continue
@@ -412,6 +565,7 @@ def _read_and_process_listener(
                     continue
                 if selected_peer_id is None or sender != selected_peer_id:
                     continue
+                _apply_codec_stat_delta(event, codec_before, listener.codec)
                 return _ListenerEvent(
                     candidate=event.candidate,
                     candidate_peer_id=event.candidate_peer_id,
@@ -420,14 +574,16 @@ def _read_and_process_listener(
                     found_rx=event.found_rx,
                     found_ack_rx=event.found_ack_rx,
                     frames_rx=event.frames_rx,
+                    codec_frames_decoded=event.codec_frames_decoded,
+                    codec_crc_failures=event.codec_crc_failures,
+                    codec_sync_hits=event.codec_sync_hits,
+                    codec_decode_failures=event.codec_decode_failures,
                 )
 
             if kind == _PONG_KIND:
                 event.pongs_rx += 1
                 target = message.get("target")
                 echo_nonce = message.get("echo_nonce")
-                remote_output = message.get("tx_device")
-                remote_input = message.get("rx_device")
                 if target != local_id:
                     continue
                 if not isinstance(echo_nonce, str) or not echo_nonce:
@@ -439,14 +595,11 @@ def _read_and_process_listener(
 
                 if event.candidate is None:
                     local_output = local[0]
-                    peer_output = remote_output if isinstance(remote_output, str) and remote_output else None
-                    peer_input = remote_input if isinstance(remote_input, str) and remote_input else None
                     event = _ListenerEvent(
                         candidate=DiscoveredAudioDevices(
                             input_device=listener.input_device,
                             output_device=local_output,
-                            peer_input_device=peer_input,
-                            peer_output_device=peer_output,
+                            modulation=modulation,
                         ),
                         candidate_peer_id=sender,
                         peer_found_ack=event.peer_found_ack,
@@ -454,14 +607,20 @@ def _read_and_process_listener(
                         found_rx=event.found_rx,
                         found_ack_rx=event.found_ack_rx,
                         frames_rx=event.frames_rx,
+                        codec_frames_decoded=event.codec_frames_decoded,
+                        codec_crc_failures=event.codec_crc_failures,
+                        codec_sync_hits=event.codec_sync_hits,
+                        codec_decode_failures=event.codec_decode_failures,
                     )
 
+    _apply_codec_stat_delta(event, codec_before, listener.codec)
     return event
 
 
 def _create_writer_channels(
     *,
     config: AudioDiscoveryConfig,
+    modulation: str,
     input_devices: list[str],
     output_devices: list[str],
     io_factory: Callable[[str, str], AudioDuplexIO] | None,
@@ -471,6 +630,7 @@ def _create_writer_channels(
     for output_device in output_devices:
         channel = _try_open_writer_channel(
             config=config,
+            modulation=modulation,
             input_devices=input_devices,
             output_device=output_device,
             io_factory=io_factory,
@@ -484,6 +644,7 @@ def _create_writer_channels(
 def _try_open_writer_channel(
     *,
     config: AudioDiscoveryConfig,
+    modulation: str,
     input_devices: list[str],
     output_device: str,
     io_factory: Callable[[str, str], AudioDuplexIO] | None,
@@ -507,7 +668,7 @@ def _try_open_writer_channel(
             input_device=anchor_input,
             output_device=output_device,
             io_obj=io_obj,
-            codec=_build_codec(config),
+            codec=_build_codec(config=config, modulation=modulation),
             next_ping_at=0.0,
             last_activity=time.monotonic(),
         )
@@ -518,6 +679,7 @@ def _try_open_writer_channel(
 def _create_listener_channels(
     *,
     config: AudioDiscoveryConfig,
+    modulation: str,
     input_devices: list[str],
     output_devices: list[str],
     io_factory: Callable[[str, str], AudioDuplexIO] | None,
@@ -527,6 +689,7 @@ def _create_listener_channels(
     for input_device in input_devices:
         channel = _try_open_listener_channel(
             config=config,
+            modulation=modulation,
             input_device=input_device,
             output_devices=output_devices,
             io_factory=io_factory,
@@ -540,6 +703,7 @@ def _create_listener_channels(
 def _try_open_listener_channel(
     *,
     config: AudioDiscoveryConfig,
+    modulation: str,
     input_device: str,
     output_devices: list[str],
     io_factory: Callable[[str, str], AudioDuplexIO] | None,
@@ -563,7 +727,7 @@ def _try_open_listener_channel(
             input_device=input_device,
             output_device=anchor_output,
             io_obj=io_obj,
-            codec=_build_codec(config),
+            codec=_build_codec(config=config, modulation=modulation),
             last_activity=time.monotonic(),
         )
 
@@ -593,6 +757,9 @@ def _format_timeout_error(
         f"pings_sent={stats.pings_sent}, pongs_rx={stats.pongs_rx}, "
         f"found_sent={stats.found_sent}, found_rx={stats.found_rx}, "
         f"found_ack_rx={stats.found_ack_rx}, frames_rx={stats.frames_rx}",
+        "Codec stats: "
+        f"frames_decoded={stats.codec_frames_decoded}, sync_hits={stats.codec_sync_hits}, "
+        f"crc_failures={stats.codec_crc_failures}, decode_failures={stats.codec_decode_failures}",
         f"Active channels at timeout: listeners={len(listeners)}, writers={len(writers)}",
         f"Pending pings at timeout: {len(pending_pings)}",
     ]
@@ -624,24 +791,82 @@ def _format_limited_items(items: list[str], *, limit: int = 12) -> list[str]:
     return out
 
 
-def _build_codec(config: AudioDiscoveryConfig) -> AudioFrameCodec:
-    return AudioFrameCodec(
+def _build_codec(*, config: AudioDiscoveryConfig, modulation: str) -> AudioModulationCodec:
+    return create_audio_frame_codec(
+        modulation=modulation,
+        sample_rate=max(config.sample_rate, 8000),
         byte_repeat=max(config.byte_repeat, 1),
         marker_run=max(config.marker_run, 4),
     )
 
 
-def _send_discovery_frame(writer: _WriterChannel, payload: dict[str, str]) -> str | None:
+def _snapshot_codec_stats(codec: AudioModulationCodec) -> dict[str, int]:
+    try:
+        snap = codec.snapshot_stats()
+    except Exception:
+        return {
+            "frames_decoded": 0,
+            "crc_failures": 0,
+            "sync_hits": 0,
+            "decode_failures": 0,
+        }
+
+    return {
+        "frames_decoded": int(snap.get("frames_decoded", 0)),
+        "crc_failures": int(snap.get("crc_failures", 0)),
+        "sync_hits": int(snap.get("sync_hits", 0)),
+        "decode_failures": int(snap.get("decode_failures", 0)),
+    }
+
+
+def _apply_codec_stat_delta(
+    event: _ListenerEvent,
+    before: dict[str, int],
+    codec: AudioModulationCodec,
+) -> None:
+    after = _snapshot_codec_stats(codec)
+    event.codec_frames_decoded += max(after["frames_decoded"] - before["frames_decoded"], 0)
+    event.codec_crc_failures += max(after["crc_failures"] - before["crc_failures"], 0)
+    event.codec_sync_hits += max(after["sync_hits"] - before["sync_hits"], 0)
+    event.codec_decode_failures += max(after["decode_failures"] - before["decode_failures"], 0)
+
+
+def _send_discovery_frame(
+    writer: _WriterChannel,
+    payload: dict[str, str],
+    *,
+    now: float,
+    sample_rate: int,
+    respect_backpressure: bool,
+) -> tuple[bool, str | None]:
+    if respect_backpressure and now < writer.next_tx_at:
+        return False, None
+
     encoded = _encode_discovery_payload(payload)
     if encoded is None:
-        return "Failed to encode discovery payload"
+        return False, "Failed to encode discovery payload"
+    pcm = writer.codec.encode_frame(encoded)
     try:
-        writer.io_obj.write(writer.codec.encode_frame(encoded))
+        writer.io_obj.write(pcm)
     except AudioIOError as exc:
-        return str(exc)
+        return False, str(exc)
     except Exception as exc:
-        return f"Unexpected audio write failure: {exc}"
-    return None
+        return False, f"Unexpected audio write failure: {exc}"
+
+    frame_seconds = (len(pcm) / 2.0) / float(max(sample_rate, 8000))
+    writer.next_tx_at = now + max(frame_seconds, 0.01)
+    return True, None
+
+
+def _count_pending_for_output(
+    pending_pings: dict[str, tuple[str, float]],
+    output_device: str,
+) -> int:
+    count = 0
+    for local_output, _timestamp in pending_pings.values():
+        if local_output == output_device:
+            count += 1
+    return count
 
 
 def _encode_discovery_payload(payload: dict[str, str]) -> bytes | None:

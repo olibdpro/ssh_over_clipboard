@@ -211,6 +211,8 @@ Troubleshooting:
 - You can force a backend: `--audio-backend pulse-cli` or an ffmpeg format backend such as `--audio-backend alsa` (if available).
 
 Useful reliability knobs:
+- `--audio-modulation` (`auto`, `robust-v1`, `legacy`; default `auto`)
+  - `auto` tries `robust-v1` first during discovery, then falls back to `legacy`.
 - `--audio-byte-repeat` (simple error-correction repeat factor, default `3`)
 - `--audio-ack-timeout-ms` / `--audio-max-retries`
 - `--audio-marker-run` (frame delimiter marker length)
