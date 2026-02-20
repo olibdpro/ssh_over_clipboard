@@ -6,6 +6,7 @@ import errno
 import os
 import select
 import subprocess
+import time
 from typing import Protocol
 
 
@@ -359,6 +360,16 @@ class FFmpegAudioDuplexIO:
             raise AudioIOError(_process_stderr(self._capture, "ffmpeg capture"))
         if self._playback.poll() is not None:
             raise AudioIOError(_process_stderr(self._playback, "ffmpeg playback"))
+        self._wait_for_startup_stability()
+
+    def _wait_for_startup_stability(self) -> None:
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline:
+            if self._capture.poll() is not None:
+                raise AudioIOError(_process_stderr(self._capture, "ffmpeg capture"))
+            if self._playback.poll() is not None:
+                raise AudioIOError(_process_stderr(self._playback, "ffmpeg playback"))
+            time.sleep(0.01)
 
     def read(self, max_bytes: int) -> bytes:
         if self._closed:
@@ -603,7 +614,18 @@ def build_audio_duplex_io(
         )
 
     if requested == "auto":
-        ffmpeg_error: str | None = None
+        pulse_error: str | None = None
+        try:
+            return PulseCliAudioDuplexIO(
+                input_device=input_device,
+                output_device=output_device,
+                sample_rate=sample_rate,
+                read_timeout=read_timeout,
+                write_timeout=write_timeout,
+            )
+        except AudioIOError as exc:
+            pulse_error = str(exc)
+
         try:
             return FFmpegAudioDuplexIO(
                 ffmpeg_bin=ffmpeg_bin,
@@ -614,22 +636,11 @@ def build_audio_duplex_io(
                 read_timeout=read_timeout,
                 write_timeout=write_timeout,
             )
-        except AudioIOError as exc:
-            ffmpeg_error = str(exc)
-
-        try:
-            return PulseCliAudioDuplexIO(
-                input_device=input_device,
-                output_device=output_device,
-                sample_rate=sample_rate,
-                read_timeout=read_timeout,
-                write_timeout=write_timeout,
-            )
-        except AudioIOError as pulse_exc:
+        except AudioIOError as ffmpeg_exc:
             raise AudioIOError(
                 "No usable audio backend found. "
-                f"ffmpeg attempt failed: {ffmpeg_error}; pulse-cli fallback failed: {pulse_exc}"
-            ) from pulse_exc
+                f"pulse-cli attempt failed: {pulse_error}; ffmpeg fallback failed: {ffmpeg_exc}"
+            ) from ffmpeg_exc
 
     return FFmpegAudioDuplexIO(
         ffmpeg_bin=ffmpeg_bin,
