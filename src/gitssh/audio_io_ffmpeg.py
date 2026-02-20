@@ -27,6 +27,24 @@ class AudioDuplexIO(Protocol):
         ...
 
 
+def _process_stderr(proc: subprocess.Popen[bytes] | subprocess.Popen[str], label: str) -> str:
+    stderr_text = ""
+    try:
+        if proc.stderr is not None:
+            raw = proc.stderr.read()
+            if isinstance(raw, bytes):
+                stderr_text = raw.decode("utf-8", errors="ignore")
+            else:
+                stderr_text = raw or ""
+    except Exception:
+        stderr_text = ""
+
+    cleaned = (stderr_text or "").strip()
+    if cleaned:
+        return f"{label} process exited unexpectedly: {cleaned}"
+    return f"{label} process exited unexpectedly"
+
+
 def _ffmpeg_format_capabilities(ffmpeg_bin: str) -> dict[str, tuple[bool, bool]]:
     try:
         result = subprocess.run(
@@ -213,32 +231,15 @@ class FFmpegAudioDuplexIO:
 
         # Fail fast when ffmpeg exits immediately due to bad device/backend config.
         if self._capture.poll() is not None:
-            raise AudioIOError(self._process_error(self._capture, "ffmpeg capture"))
+            raise AudioIOError(_process_stderr(self._capture, "ffmpeg capture"))
         if self._playback.poll() is not None:
-            raise AudioIOError(self._process_error(self._playback, "ffmpeg playback"))
-
-    def _process_error(self, proc: subprocess.Popen[bytes] | subprocess.Popen[str], label: str) -> str:
-        stderr_text = ""
-        try:
-            if proc.stderr is not None:
-                raw = proc.stderr.read()
-                if isinstance(raw, bytes):
-                    stderr_text = raw.decode("utf-8", errors="ignore")
-                else:
-                    stderr_text = raw or ""
-        except Exception:
-            stderr_text = ""
-
-        cleaned = (stderr_text or "").strip()
-        if cleaned:
-            return f"{label} process exited unexpectedly: {cleaned}"
-        return f"{label} process exited unexpectedly"
+            raise AudioIOError(_process_stderr(self._playback, "ffmpeg playback"))
 
     def read(self, max_bytes: int) -> bytes:
         if self._closed:
             return b""
         if self._capture.poll() is not None:
-            raise AudioIOError(self._process_error(self._capture, "ffmpeg capture"))
+            raise AudioIOError(_process_stderr(self._capture, "ffmpeg capture"))
         if max_bytes < 1:
             return b""
 
@@ -258,7 +259,7 @@ class FFmpegAudioDuplexIO:
         if self._closed or not data:
             return
         if self._playback.poll() is not None:
-            raise AudioIOError(self._process_error(self._playback, "ffmpeg playback"))
+            raise AudioIOError(_process_stderr(self._playback, "ffmpeg playback"))
 
         view = memoryview(data)
         deadline = self.write_timeout
@@ -301,3 +302,205 @@ class FFmpegAudioDuplexIO:
                 except subprocess.TimeoutExpired:
                     proc.kill()
                     proc.wait(timeout=1.0)
+
+
+class PulseCliAudioDuplexIO:
+    """Duplex PCM I/O using `parec` and `pacat` utilities."""
+
+    def __init__(
+        self,
+        *,
+        input_device: str,
+        output_device: str,
+        sample_rate: int,
+        read_timeout: float,
+        write_timeout: float,
+        parec_bin: str = "parec",
+        pacat_bin: str = "pacat",
+    ) -> None:
+        self.read_timeout = max(read_timeout, 0.0)
+        self.write_timeout = max(write_timeout, 0.0)
+
+        capture_cmd = [
+            parec_bin,
+            "--raw",
+            "--channels=1",
+            f"--rate={sample_rate}",
+            "--format=s16le",
+            f"--device={input_device}",
+        ]
+        playback_cmd = [
+            pacat_bin,
+            "--raw",
+            "--playback",
+            "--channels=1",
+            f"--rate={sample_rate}",
+            "--format=s16le",
+            f"--device={output_device}",
+        ]
+
+        try:
+            self._capture = subprocess.Popen(
+                capture_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=True,
+            )
+            self._playback = subprocess.Popen(
+                playback_cmd,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                close_fds=True,
+            )
+        except FileNotFoundError as exc:
+            raise AudioIOError(
+                "Pulse CLI tools are not available. Install pulseaudio-utils (parec/pacat)."
+            ) from exc
+        except Exception as exc:
+            raise AudioIOError(f"Failed to start parec/pacat pipelines: {exc}") from exc
+
+        if self._capture.stdout is None or self._playback.stdin is None:
+            self.close()
+            raise AudioIOError("Failed to initialize parec/pacat pipes")
+
+        self._rx_fd = self._capture.stdout.fileno()
+        self._tx_fd = self._playback.stdin.fileno()
+        os.set_blocking(self._rx_fd, False)
+        os.set_blocking(self._tx_fd, False)
+        self._closed = False
+
+        if self._capture.poll() is not None:
+            raise AudioIOError(_process_stderr(self._capture, "parec capture"))
+        if self._playback.poll() is not None:
+            raise AudioIOError(_process_stderr(self._playback, "pacat playback"))
+
+    def read(self, max_bytes: int) -> bytes:
+        if self._closed:
+            return b""
+        if self._capture.poll() is not None:
+            raise AudioIOError(_process_stderr(self._capture, "parec capture"))
+        if max_bytes < 1:
+            return b""
+
+        ready, _, _ = select.select([self._rx_fd], [], [], self.read_timeout)
+        if not ready:
+            return b""
+        try:
+            return os.read(self._rx_fd, max_bytes)
+        except BlockingIOError:
+            return b""
+        except OSError as exc:
+            if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                return b""
+            raise AudioIOError(f"parec read failed: {exc}") from exc
+
+    def write(self, data: bytes) -> None:
+        if self._closed or not data:
+            return
+        if self._playback.poll() is not None:
+            raise AudioIOError(_process_stderr(self._playback, "pacat playback"))
+
+        view = memoryview(data)
+        deadline = self.write_timeout
+        while view:
+            _, writable, _ = select.select([], [self._tx_fd], [], deadline)
+            if not writable:
+                raise AudioIOError("Timed out writing PCM data to pacat")
+            try:
+                written = os.write(self._tx_fd, view)
+            except BlockingIOError:
+                continue
+            except OSError as exc:
+                if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                    continue
+                raise AudioIOError(f"pacat write failed: {exc}") from exc
+            if written <= 0:
+                raise AudioIOError("Zero-byte write to pacat")
+            view = view[written:]
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
+        for proc, close_stdin in (
+            (getattr(self, "_playback", None), True),
+            (getattr(self, "_capture", None), False),
+        ):
+            if proc is None:
+                continue
+            try:
+                if close_stdin and proc.stdin is not None:
+                    proc.stdin.close()
+            except OSError:
+                pass
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=1.0)
+
+
+def build_audio_duplex_io(
+    *,
+    ffmpeg_bin: str,
+    backend: str,
+    input_device: str,
+    output_device: str,
+    sample_rate: int,
+    read_timeout: float,
+    write_timeout: float,
+) -> AudioDuplexIO:
+    requested = (backend or "").strip().lower()
+
+    if requested == "pulse-cli":
+        return PulseCliAudioDuplexIO(
+            input_device=input_device,
+            output_device=output_device,
+            sample_rate=sample_rate,
+            read_timeout=read_timeout,
+            write_timeout=write_timeout,
+        )
+
+    if requested == "auto":
+        ffmpeg_error: str | None = None
+        try:
+            return FFmpegAudioDuplexIO(
+                ffmpeg_bin=ffmpeg_bin,
+                backend="auto",
+                input_device=input_device,
+                output_device=output_device,
+                sample_rate=sample_rate,
+                read_timeout=read_timeout,
+                write_timeout=write_timeout,
+            )
+        except AudioIOError as exc:
+            ffmpeg_error = str(exc)
+
+        try:
+            return PulseCliAudioDuplexIO(
+                input_device=input_device,
+                output_device=output_device,
+                sample_rate=sample_rate,
+                read_timeout=read_timeout,
+                write_timeout=write_timeout,
+            )
+        except AudioIOError as pulse_exc:
+            raise AudioIOError(
+                "No usable audio backend found. "
+                f"ffmpeg attempt failed: {ffmpeg_error}; pulse-cli fallback failed: {pulse_exc}"
+            ) from pulse_exc
+
+    return FFmpegAudioDuplexIO(
+        ffmpeg_bin=ffmpeg_bin,
+        backend=requested,
+        input_device=input_device,
+        output_device=output_device,
+        sample_rate=sample_rate,
+        read_timeout=read_timeout,
+        write_timeout=write_timeout,
+    )

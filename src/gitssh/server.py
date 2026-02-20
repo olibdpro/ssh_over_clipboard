@@ -633,7 +633,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--audio-backend",
         default="auto",
-        help="FFmpeg audio backend for --transport audio-modem (default: auto-detect)",
+        help="Audio backend for --transport audio-modem (auto, pulse-cli, or ffmpeg format name)",
     )
     parser.add_argument(
         "--audio-ffmpeg-bin",

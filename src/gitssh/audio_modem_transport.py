@@ -10,7 +10,7 @@ import time
 from typing import Callable, Deque
 import zlib
 
-from .audio_io_ffmpeg import AudioDuplexIO, AudioIOError, FFmpegAudioDuplexIO
+from .audio_io_ffmpeg import AudioDuplexIO, AudioIOError, build_audio_duplex_io
 from .audio_modem import AudioFrameCodec
 from .protocol import Message, decode_message, encode_message
 from .transport import TransportError
@@ -152,7 +152,7 @@ class AudioModemTransportBackend:
             if self.config.io_factory is not None:
                 self._io = self.config.io_factory(self.config)
             else:
-                self._io = FFmpegAudioDuplexIO(
+                self._io = build_audio_duplex_io(
                     ffmpeg_bin=self.config.ffmpeg_bin,
                     backend=self.config.audio_backend,
                     input_device=self.config.input_device,

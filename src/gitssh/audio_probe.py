@@ -10,9 +10,9 @@ import time
 
 from .audio_io_ffmpeg import (
     AudioIOError,
-    FFmpegAudioDuplexIO,
     _ffmpeg_format_capabilities,
     _format_duplex_backends,
+    build_audio_duplex_io,
 )
 
 
@@ -69,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
     do_rx = args.rx or (not args.tx and not args.rx)
 
     try:
-        io_obj = FFmpegAudioDuplexIO(
+        io_obj = build_audio_duplex_io(
             ffmpeg_bin=args.ffmpeg_bin,
             backend=args.audio_backend,
             input_device=args.input_device,

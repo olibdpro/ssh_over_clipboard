@@ -202,8 +202,8 @@ sshg localhost \
 Troubleshooting:
 - If `sshg-audio-probe` reports ffmpeg capture/playback exit, rerun with explicit `--input-device` and `--output-device`.
 - Run `pactl list short sources` / `pactl list short sinks` and select concrete device names.
-- If ffmpeg lacks `pulse` support, backend auto-detection will prefer any available duplex backend (e.g. `alsa`).
-- You can force a backend: `--audio-backend alsa` or `--audio-backend pipewire` (if supported by your ffmpeg build).
+- If ffmpeg lacks `pulse` support, backend auto mode falls back to `pulse-cli` (`parec`/`pacat`).
+- You can force a backend: `--audio-backend pulse-cli` or an ffmpeg format backend such as `--audio-backend alsa` (if available).
 
 Useful reliability knobs:
 - `--audio-byte-repeat` (simple error-correction repeat factor, default `3`)
