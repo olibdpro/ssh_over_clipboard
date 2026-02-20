@@ -185,19 +185,24 @@ Run server in VM:
 
 ```bash
 sshgd -v \
-  --transport audio-modem \
-  --audio-input-device default \
-  --audio-output-device default
+  --transport audio-modem
 ```
 
 Run client on host:
 
 ```bash
 sshg localhost \
-  --transport audio-modem \
-  --audio-input-device sshg_rx_sink.monitor \
-  --audio-output-device sshg_tx_sink
+  --transport audio-modem
 ```
+
+If `--audio-input-device` and `--audio-output-device` are both omitted, `sshg` and `sshgd` run an auto-discovery sequence:
+- warns you to lower speaker volume,
+- asks for confirmation before probes start,
+- sends/listens discovery pings on all detected input/output devices,
+- prints the selected `--audio-input-device` / `--audio-output-device` flags to reuse next time.
+- requires an interactive terminal for confirmation (non-interactive runs should pass both device flags explicitly).
+
+If you prefer fixed routing, pass both flags explicitly.
 
 Troubleshooting:
 - If `sshg-audio-probe` reports ffmpeg capture/playback exit, rerun with explicit `--input-device` and `--output-device`.

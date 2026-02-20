@@ -4,3 +4,10 @@ __pycache__/
 .pytest_cache/
 .mypy_cache/
 .venv/
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/inspectionProfiles/profiles_settings.xml
+/.idea/inspectionProfiles/Project_Default.xml
+/.idea/ssh_over_clipboard.iml
+/.idea/vcs.xml
+/.idea/copilot.data.migration.ask2agent.xml

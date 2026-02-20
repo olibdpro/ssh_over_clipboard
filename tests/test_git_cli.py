@@ -19,6 +19,8 @@ class GitClientCliTests(unittest.TestCase):
         self.assertEqual(args.transport, "git")
         self.assertEqual(args.serial_port, "/dev/ttyACM0")
         self.assertEqual(args.serial_baud, 3000000)
+        self.assertIsNone(args.audio_input_device)
+        self.assertIsNone(args.audio_output_device)
 
     def test_supports_usb_serial_transport_options(self) -> None:
         args = build_client_parser().parse_args(
@@ -68,6 +70,8 @@ class GitServerCliTests(unittest.TestCase):
         self.assertEqual(args.transport, "git")
         self.assertEqual(args.serial_port, "/dev/ttyACM0")
         self.assertEqual(args.serial_baud, 3000000)
+        self.assertIsNone(args.audio_input_device)
+        self.assertIsNone(args.audio_output_device)
 
     def test_supports_usb_serial_transport_options(self) -> None:
         args = build_server_parser().parse_args(

@@ -8,6 +8,7 @@ import binascii
 from dataclasses import dataclass
 import os
 import select
+import shlex
 import shutil
 import signal
 import sys
@@ -25,6 +26,8 @@ from .git_transport import (
     DEFAULT_BRANCH_S2C,
     GitTransportBackend,
 )
+from .audio_device_discovery import AudioDiscoveryConfig, discover_audio_devices
+from .audio_io_ffmpeg import AudioIOError
 from .audio_modem_transport import AudioModemTransportBackend, AudioModemTransportConfig
 from .protocol import Message, build_message
 from .transport import TransportBackend, TransportError
@@ -531,13 +534,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--audio-input-device",
-        default="default",
-        help="Input capture device for --transport audio-modem (Pulse/PipeWire name)",
+        default=None,
+        help="Input capture device for --transport audio-modem (Pulse/PipeWire name). Omit with output to auto-discover.",
     )
     parser.add_argument(
         "--audio-output-device",
-        default="default",
-        help="Output playback device for --transport audio-modem (Pulse/PipeWire name)",
+        default=None,
+        help="Output playback device for --transport audio-modem (Pulse/PipeWire name). Omit with input to auto-discover.",
     )
     parser.add_argument(
         "--audio-sample-rate",
@@ -675,10 +678,51 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
         )
 
     if args.transport == "audio-modem":
+        input_device = _normalize_audio_device_arg(args.audio_input_device)
+        output_device = _normalize_audio_device_arg(args.audio_output_device)
+
+        if (input_device is None) != (output_device is None):
+            raise TransportError(
+                "For --transport audio-modem, pass both --audio-input-device and --audio-output-device "
+                "or omit both to use automatic discovery."
+            )
+
+        if input_device is None and output_device is None:
+            _confirm_audio_discovery("sshg")
+            discovery_logger = (
+                (lambda text: print(f"[sshg] {text}", file=sys.stderr)) if args.verbose else None
+            )
+            try:
+                discovered = discover_audio_devices(
+                    AudioDiscoveryConfig(
+                        ffmpeg_bin=args.audio_ffmpeg_bin,
+                        audio_backend=args.audio_backend,
+                        sample_rate=max(args.audio_sample_rate, 8000),
+                        read_timeout=max(args.audio_read_timeout_ms / 1000.0, 0.0),
+                        write_timeout=max(args.audio_write_timeout_ms / 1000.0, 0.001),
+                        byte_repeat=max(args.audio_byte_repeat, 1),
+                        marker_run=max(args.audio_marker_run, 4),
+                    ),
+                    logger=discovery_logger,
+                )
+            except AudioIOError as exc:
+                raise TransportError(f"Audio auto-discovery failed: {exc}") from exc
+
+            input_device = discovered.input_device
+            output_device = discovered.output_device
+            print(
+                "sshg: auto-selected audio devices. Reuse with: "
+                f"--audio-input-device {shlex.quote(input_device)} "
+                f"--audio-output-device {shlex.quote(output_device)}",
+                file=sys.stderr,
+            )
+
+        assert input_device is not None
+        assert output_device is not None
         return AudioModemTransportBackend(
             AudioModemTransportConfig(
-                input_device=args.audio_input_device,
-                output_device=args.audio_output_device,
+                input_device=input_device,
+                output_device=output_device,
                 sample_rate=max(args.audio_sample_rate, 8000),
                 read_timeout=max(args.audio_read_timeout_ms / 1000.0, 0.0),
                 write_timeout=max(args.audio_write_timeout_ms / 1000.0, 0.001),
@@ -700,6 +744,34 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
         outbound_branch=args.branch_c2s,
         auto_init_local=True,
     )
+
+
+def _normalize_audio_device_arg(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    return cleaned or None
+
+
+def _confirm_audio_discovery(program: str) -> None:
+    print(
+        f"{program}: audio auto-discovery will send probe tones on all detected output devices.",
+        file=sys.stderr,
+    )
+    print(
+        f"{program}: lower your speaker/headphone volume before continuing.",
+        file=sys.stderr,
+    )
+    if not sys.stdin.isatty():
+        raise TransportError(
+            "Audio auto-discovery requires interactive confirmation. "
+            "Specify --audio-input-device and --audio-output-device explicitly."
+        )
+
+    print(f"{program}: continue with device discovery? [y/N]: ", end="", file=sys.stderr, flush=True)
+    response = sys.stdin.readline()
+    if response.strip().lower() not in {"y", "yes"}:
+        raise TransportError("Audio auto-discovery cancelled by user")
 
 
 def main(argv: list[str] | None = None) -> int:
