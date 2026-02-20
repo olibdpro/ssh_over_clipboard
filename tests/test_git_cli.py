@@ -3,6 +3,7 @@ from __future__ import annotations
 import pathlib
 import sys
 import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -22,13 +23,9 @@ class GitClientCliTests(unittest.TestCase):
         self.assertEqual(args.transport, "git")
         self.assertEqual(args.serial_port, "/dev/ttyACM0")
         self.assertEqual(args.serial_baud, 3000000)
-        self.assertIsNone(args.audio_input_device)
-        self.assertIsNone(args.audio_output_device)
-        self.assertEqual(args.audio_discovery_timeout, 90.0)
-        self.assertEqual(args.audio_discovery_ping_interval_ms, 120)
-        self.assertEqual(args.audio_discovery_found_interval_ms, 120)
-        self.assertEqual(args.audio_discovery_candidate_grace, 20.0)
-        self.assertEqual(args.audio_discovery_max_silent_seconds, 10.0)
+        self.assertIsNone(args.audio_stream_index)
+        self.assertIsNone(args.audio_stream_match)
+        self.assertEqual(args.audio_backend, "pulse-cli")
         self.assertEqual(args.audio_modulation, "auto")
 
     def test_supports_usb_serial_transport_options(self) -> None:
@@ -56,39 +53,69 @@ class GitClientCliTests(unittest.TestCase):
                 "localhost",
                 "--transport",
                 "audio-modem",
-                "--audio-input-device",
-                "server_output_receiver",
-                "--audio-output-device",
-                "client_response_sender",
+                "--audio-stream-index",
+                "77",
+                "--audio-stream-match",
+                "chrome|firefox",
                 "--audio-sample-rate",
                 "44100",
                 "--audio-byte-repeat",
                 "5",
                 "--audio-modulation",
                 "robust-v1",
-                "--audio-discovery-timeout",
-                "30",
-                "--audio-discovery-ping-interval-ms",
-                "80",
-                "--audio-discovery-found-interval-ms",
-                "90",
-                "--audio-discovery-candidate-grace",
-                "6",
-                "--audio-discovery-max-silent-seconds",
-                "4",
+                "--audio-backend",
+                "pulse-cli",
             ]
         )
         self.assertEqual(args.transport, "audio-modem")
-        self.assertEqual(args.audio_input_device, "server_output_receiver")
-        self.assertEqual(args.audio_output_device, "client_response_sender")
+        self.assertEqual(args.audio_stream_index, 77)
+        self.assertEqual(args.audio_stream_match, "chrome|firefox")
         self.assertEqual(args.audio_sample_rate, 44100)
         self.assertEqual(args.audio_byte_repeat, 5)
         self.assertEqual(args.audio_modulation, "robust-v1")
-        self.assertEqual(args.audio_discovery_timeout, 30.0)
-        self.assertEqual(args.audio_discovery_ping_interval_ms, 80)
-        self.assertEqual(args.audio_discovery_found_interval_ms, 90)
-        self.assertEqual(args.audio_discovery_candidate_grace, 6.0)
-        self.assertEqual(args.audio_discovery_max_silent_seconds, 4.0)
+        self.assertEqual(args.audio_backend, "pulse-cli")
+
+    def test_audio_modem_rejects_non_pulse_backend(self) -> None:
+        args = build_client_parser().parse_args(
+            [
+                "localhost",
+                "--transport",
+                "audio-modem",
+                "--audio-backend",
+                "alsa",
+            ]
+        )
+        with self.assertRaises(TransportError):
+            build_client_backend(args)
+
+    def test_audio_modem_backend_build_with_explicit_stream_index(self) -> None:
+        args = build_client_parser().parse_args(
+            [
+                "localhost",
+                "--transport",
+                "audio-modem",
+                "--audio-stream-index",
+                "11",
+            ]
+        )
+        fake_manager = mock.MagicMock()
+        fake_manager.ensure_ready.return_value = mock.Mock(
+            sink_name="sshg_client_virtual_mic_sink",
+            source_name="sshg_client_virtual_mic_source",
+        )
+
+        with (
+            mock.patch("gitssh.client.resolve_client_capture_stream_index", return_value=11),
+            mock.patch("gitssh.client.ClientVirtualMicManager", return_value=fake_manager),
+        ):
+            backend = build_client_backend(args)
+
+        self.assertEqual(
+            backend.name(),
+            "audio-modem:pulse-cli:robust-v1:in=@DEFAULT_MONITOR@,out=sshg_client_virtual_mic_sink",
+        )
+        backend.close()
+        fake_manager.close.assert_called_once()
 
     def test_supports_google_drive_transport_options(self) -> None:
         args = build_client_parser().parse_args(
@@ -133,13 +160,7 @@ class GitServerCliTests(unittest.TestCase):
         self.assertEqual(args.transport, "git")
         self.assertEqual(args.serial_port, "/dev/ttyACM0")
         self.assertEqual(args.serial_baud, 3000000)
-        self.assertIsNone(args.audio_input_device)
-        self.assertIsNone(args.audio_output_device)
-        self.assertEqual(args.audio_discovery_timeout, 90.0)
-        self.assertEqual(args.audio_discovery_ping_interval_ms, 120)
-        self.assertEqual(args.audio_discovery_found_interval_ms, 120)
-        self.assertEqual(args.audio_discovery_candidate_grace, 20.0)
-        self.assertEqual(args.audio_discovery_max_silent_seconds, 10.0)
+        self.assertEqual(args.audio_backend, "pulse-cli")
         self.assertEqual(args.audio_modulation, "auto")
 
     def test_supports_usb_serial_transport_options(self) -> None:
@@ -165,36 +186,46 @@ class GitServerCliTests(unittest.TestCase):
             [
                 "--transport",
                 "audio-modem",
-                "--audio-input-device",
-                "client_output_receiver",
-                "--audio-output-device",
-                "server_response_sender",
                 "--audio-marker-run",
                 "24",
                 "--audio-modulation",
                 "legacy",
-                "--audio-discovery-timeout",
-                "35",
-                "--audio-discovery-ping-interval-ms",
-                "100",
-                "--audio-discovery-found-interval-ms",
-                "110",
-                "--audio-discovery-candidate-grace",
-                "7.5",
-                "--audio-discovery-max-silent-seconds",
-                "5.5",
+                "--audio-backend",
+                "pulse-cli",
             ]
         )
         self.assertEqual(args.transport, "audio-modem")
-        self.assertEqual(args.audio_input_device, "client_output_receiver")
-        self.assertEqual(args.audio_output_device, "server_response_sender")
         self.assertEqual(args.audio_marker_run, 24)
         self.assertEqual(args.audio_modulation, "legacy")
-        self.assertEqual(args.audio_discovery_timeout, 35.0)
-        self.assertEqual(args.audio_discovery_ping_interval_ms, 100)
-        self.assertEqual(args.audio_discovery_found_interval_ms, 110)
-        self.assertEqual(args.audio_discovery_candidate_grace, 7.5)
-        self.assertEqual(args.audio_discovery_max_silent_seconds, 5.5)
+        self.assertEqual(args.audio_backend, "pulse-cli")
+
+    def test_audio_modem_rejects_non_pulse_backend(self) -> None:
+        args = build_server_parser().parse_args(
+            [
+                "--transport",
+                "audio-modem",
+                "--audio-backend",
+                "alsa",
+            ]
+        )
+        with self.assertRaises(TransportError):
+            build_server_backend(args)
+
+    def test_audio_modem_backend_uses_server_defaults(self) -> None:
+        args = build_server_parser().parse_args(
+            [
+                "--transport",
+                "audio-modem",
+            ]
+        )
+        with mock.patch("gitssh.server.resolve_server_default_paths", return_value=("mic.default", "speaker.default")):
+            backend = build_server_backend(args)
+
+        self.assertEqual(
+            backend.name(),
+            "audio-modem:pulse-cli:robust-v1:in=mic.default,out=speaker.default",
+        )
+        backend.close()
 
     def test_supports_google_drive_transport_options(self) -> None:
         args = build_server_parser().parse_args(

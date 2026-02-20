@@ -24,6 +24,9 @@ class AudioSetupError(RuntimeError):
 
 
 STATE_PATH = Path.home() / ".cache" / "sshg_audio_setup.json"
+CLIENT_VIRTUAL_MIC_SOURCE = "sshg_client_virtual_mic_source"
+CLIENT_VIRTUAL_MIC_DESCRIPTION = "Client Response Sender"
+_CLIENT_VIRTUAL_MIC_FALLBACK_DESCRIPTION = "Client_Response_Sender"
 
 
 def _run_pactl(args: list[str]) -> str:
@@ -45,6 +48,16 @@ def _load_module(module_name: str, module_args: list[str]) -> int:
         return int(output.strip())
     except ValueError as exc:
         raise AudioSetupError(f"Unexpected pactl module id: {output!r}") from exc
+
+
+def _list_short_device_names(kind: str) -> set[str]:
+    output = _run_pactl(["list", "short", kind])
+    names: set[str] = set()
+    for raw in output.splitlines():
+        fields = raw.split()
+        if len(fields) >= 2:
+            names.add(fields[1])
+    return names
 
 
 def _ensure_parent(path: Path) -> None:
@@ -100,11 +113,36 @@ def create_client_devices() -> None:
     )
     _append_module_state(state, role="client", module_id=tx_sink, module_name="module-null-sink")
 
+    existing_sources = _list_short_device_names("sources")
+    source_state = "reused"
+    if CLIENT_VIRTUAL_MIC_SOURCE not in existing_sources:
+        source_state = "created"
+        source_args = [
+            f"master={output_sink_name}.monitor",
+            f"source_name={CLIENT_VIRTUAL_MIC_SOURCE}",
+            f"source_properties=device.description={CLIENT_VIRTUAL_MIC_DESCRIPTION}",
+        ]
+        try:
+            source_module = _load_module("module-remap-source", source_args)
+        except AudioSetupError:
+            fallback_args = [
+                f"master={output_sink_name}.monitor",
+                f"source_name={CLIENT_VIRTUAL_MIC_SOURCE}",
+                f"source_properties=device.description={_CLIENT_VIRTUAL_MIC_FALLBACK_DESCRIPTION}",
+            ]
+            source_module = _load_module("module-remap-source", fallback_args)
+            print("- note: Pulse accepted description 'Client_Response_Sender' on this host")
+        _append_module_state(state, role="client", module_id=source_module, module_name="module-remap-source")
+
     _write_state(state)
     print("Created client audio devices:")
     print(f"- sink: {input_sink_name}")
     print(f"- sink: {output_sink_name}")
-    print(f"- source: {input_sink_name}.monitor (auto monitor source)")
+    print(
+        f"- source (UI-selectable mic): {CLIENT_VIRTUAL_MIC_SOURCE} "
+        f"(description target: {CLIENT_VIRTUAL_MIC_DESCRIPTION}, {source_state})"
+    )
+    print(f"- pactl set-default-source {CLIENT_VIRTUAL_MIC_SOURCE}")
 
 
 def create_server_devices() -> None:
@@ -203,7 +241,10 @@ def _is_managed_pulse_line(line: str) -> bool:
     fields = line.split()
     if len(fields) < 2:
         return False
-    return is_managed_pulse_device_name(fields[1])
+    name = fields[1]
+    if name == CLIENT_VIRTUAL_MIC_SOURCE:
+        return True
+    return is_managed_pulse_device_name(name)
 
 
 def _build_parser() -> argparse.ArgumentParser:

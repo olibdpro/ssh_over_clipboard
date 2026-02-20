@@ -7,7 +7,6 @@ import base64
 import binascii
 from dataclasses import dataclass, field
 import getpass
-import shlex
 import socket
 import sys
 import threading
@@ -30,10 +29,9 @@ from .google_drive_transport import (
     GoogleDriveTransportBackend,
     GoogleDriveTransportConfig,
 )
-from .audio_device_discovery import AudioDiscoveryConfig, discover_audio_devices
-from .audio_device_names import AudioDeviceNameError, resolve_input_device_name, resolve_output_device_name
-from .audio_io_ffmpeg import AudioIOError
+from .audio_io_ffmpeg import PulseCliAudioDuplexIO
 from .audio_modem_transport import AudioModemTransportBackend, AudioModemTransportConfig
+from .audio_pulse_runtime import PulseRuntimeError, resolve_server_default_paths
 from .protocol import Message, build_message
 from .transport import TransportBackend, TransportError
 from .usb_serial_transport import USBSerialTransportBackend, USBSerialTransportConfig
@@ -609,24 +607,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Do not apply raw termios settings to serial fd (debug/testing)",
     )
     parser.add_argument(
-        "--audio-input-device",
-        default=None,
-        help=(
-            "Input capture device (role alias or concrete backend device name). "
-            "Role aliases are backend-agnostic and resolved via --audio-backend. "
-            "Omit with output to auto-discover."
-        ),
-    )
-    parser.add_argument(
-        "--audio-output-device",
-        default=None,
-        help=(
-            "Output playback device (role alias or concrete backend device name). "
-            "Role aliases are backend-agnostic and resolved via --audio-backend. "
-            "Omit with input to auto-discover."
-        ),
-    )
-    parser.add_argument(
         "--audio-sample-rate",
         type=int,
         default=48000,
@@ -682,43 +662,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--audio-backend",
-        default="auto",
-        help="Audio backend for --transport audio-modem (auto, pulse-cli, or ffmpeg format name)",
-    )
-    parser.add_argument(
-        "--audio-ffmpeg-bin",
-        default="ffmpeg",
-        help="ffmpeg executable path for --transport audio-modem",
-    )
-    parser.add_argument(
-        "--audio-discovery-timeout",
-        type=float,
-        default=90.0,
-        help="Maximum seconds to wait for audio device auto-discovery",
-    )
-    parser.add_argument(
-        "--audio-discovery-ping-interval-ms",
-        type=int,
-        default=120,
-        help="Milliseconds between discovery ping probes per output device",
-    )
-    parser.add_argument(
-        "--audio-discovery-found-interval-ms",
-        type=int,
-        default=120,
-        help="Milliseconds between discovery found-confirmation retransmits",
-    )
-    parser.add_argument(
-        "--audio-discovery-candidate-grace",
-        type=float,
-        default=20.0,
-        help="Extra seconds to wait for final discovery acknowledgement after selecting a candidate pair",
-    )
-    parser.add_argument(
-        "--audio-discovery-max-silent-seconds",
-        type=float,
-        default=10.0,
-        help="Seconds before pending discovery ping nonces are considered stale",
+        default="pulse-cli",
+        help="Audio backend for --transport audio-modem (must be pulse-cli)",
     )
     parser.add_argument(
         "--shell",
@@ -780,70 +725,24 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
         )
 
     if args.transport == "audio-modem":
-        input_device = _normalize_audio_device_arg(args.audio_input_device)
-        output_device = _normalize_audio_device_arg(args.audio_output_device)
-        selected_modulation = args.audio_modulation
-
-        if (input_device is None) != (output_device is None):
+        requested_backend = (args.audio_backend or "").strip().lower()
+        if requested_backend != "pulse-cli":
             raise TransportError(
-                "For --transport audio-modem, pass both --audio-input-device and --audio-output-device "
-                "or omit both to use automatic discovery."
+                f"--transport audio-modem supports only --audio-backend pulse-cli in this build "
+                f"(received {args.audio_backend!r})."
             )
 
-        if input_device is None and output_device is None:
-            _confirm_audio_discovery("sshgd")
-            discovery_logger = (
-                (lambda text: print(f"[sshgd] {text}", file=sys.stderr)) if args.verbose else None
-            )
-            try:
-                discovered = discover_audio_devices(
-                    AudioDiscoveryConfig(
-                        ffmpeg_bin=args.audio_ffmpeg_bin,
-                        audio_backend=args.audio_backend,
-                        sample_rate=max(args.audio_sample_rate, 8000),
-                        read_timeout=max(args.audio_read_timeout_ms / 1000.0, 0.0),
-                        write_timeout=max(args.audio_write_timeout_ms / 1000.0, 0.001),
-                        ping_interval=max(args.audio_discovery_ping_interval_ms / 1000.0, 0.01),
-                        found_interval=max(args.audio_discovery_found_interval_ms / 1000.0, 0.01),
-                        timeout=max(args.audio_discovery_timeout, 1.0),
-                        candidate_grace=max(args.audio_discovery_candidate_grace, 0.0),
-                        max_silent_seconds=max(args.audio_discovery_max_silent_seconds, 1.0),
-                        byte_repeat=max(args.audio_byte_repeat, 1),
-                        marker_run=max(args.audio_marker_run, 4),
-                        audio_modulation=args.audio_modulation,
-                    ),
-                    logger=discovery_logger,
-                )
-            except AudioIOError as exc:
-                raise TransportError(f"Audio auto-discovery failed: {exc}") from exc
+        try:
+            input_device, output_device = resolve_server_default_paths()
+        except PulseRuntimeError as exc:
+            raise TransportError(f"Failed to resolve server default microphone/speakers: {exc}") from exc
 
-            input_device = discovered.input_device
-            output_device = discovered.output_device
-            selected_modulation = discovered.modulation
+        if args.verbose:
             print(
-                "sshgd: auto-selected audio devices. Reuse with: "
-                f"--audio-input-device {shlex.quote(input_device)} "
-                f"--audio-output-device {shlex.quote(output_device)} "
-                f"--audio-modulation {shlex.quote(selected_modulation)}",
+                f"[sshgd] using default Pulse devices input={input_device} output={output_device}",
                 file=sys.stderr,
             )
-        else:
-            assert input_device is not None
-            assert output_device is not None
-            try:
-                input_device = resolve_input_device_name(
-                    requested=input_device,
-                    backend=args.audio_backend,
-                )
-                output_device = resolve_output_device_name(
-                    requested=output_device,
-                    backend=args.audio_backend,
-                )
-            except AudioDeviceNameError as exc:
-                raise TransportError(str(exc)) from exc
 
-        assert input_device is not None
-        assert output_device is not None
         return AudioModemTransportBackend(
             AudioModemTransportConfig(
                 input_device=input_device,
@@ -856,10 +755,16 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
                 max_retries=max(args.audio_max_retries, 1),
                 byte_repeat=max(args.audio_byte_repeat, 1),
                 marker_run=max(args.audio_marker_run, 4),
-                audio_modulation=selected_modulation,
-                ffmpeg_bin=args.audio_ffmpeg_bin,
-                audio_backend=args.audio_backend,
+                audio_modulation=args.audio_modulation,
+                audio_backend="pulse-cli",
                 verbose=args.verbose,
+                io_factory=lambda config: PulseCliAudioDuplexIO(
+                    input_device=input_device,
+                    output_device=output_device,
+                    sample_rate=max(config.sample_rate, 8000),
+                    read_timeout=max(config.read_timeout, 0.0),
+                    write_timeout=max(config.write_timeout, 0.001),
+                ),
             )
         )
 
@@ -887,36 +792,6 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
         outbound_branch=args.branch_s2c,
         auto_init_local=True,
     )
-
-
-def _normalize_audio_device_arg(value: str | None) -> str | None:
-    if value is None:
-        return None
-    cleaned = value.strip()
-    return cleaned or None
-
-
-def _confirm_audio_discovery(program: str) -> None:
-    print(
-        f"{program}: audio auto-discovery will send probe tones on all detected input and output devices in parallel.",
-        file=sys.stderr,
-    )
-    print(
-        f"{program}: lower your speaker/headphone volume before continuing.",
-        file=sys.stderr,
-    )
-    if not sys.stdin.isatty():
-        raise TransportError(
-            "Audio auto-discovery requires interactive confirmation. "
-            "Specify --audio-input-device and --audio-output-device explicitly."
-        )
-
-    print(f"{program}: continue with device discovery? [y/N]: ", end="", file=sys.stderr, flush=True)
-    response = sys.stdin.readline()
-    if response.strip().lower() not in {"y", "yes"}:
-        raise TransportError("Audio auto-discovery cancelled by user")
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)

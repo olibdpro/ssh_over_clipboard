@@ -10,7 +10,35 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from gitssh.audio_io_ffmpeg import AudioIOError, build_audio_duplex_io
+from gitssh.audio_io_ffmpeg import AudioIOError, PulseCliAudioDuplexIO, build_audio_duplex_io
+
+
+class _DummyPipe:
+    def fileno(self) -> int:
+        return 0
+
+    def close(self) -> None:
+        return
+
+
+class _DummyProcess:
+    def __init__(self, *, has_stdout: bool, has_stdin: bool) -> None:
+        self.stdout = _DummyPipe() if has_stdout else None
+        self.stdin = _DummyPipe() if has_stdin else None
+        self.stderr = _DummyPipe()
+
+    def poll(self) -> int | None:
+        return None
+
+    def terminate(self) -> None:
+        return
+
+    def wait(self, timeout: float | None = None) -> int:
+        del timeout
+        return 0
+
+    def kill(self) -> None:
+        return
 
 
 class AudioIoFfmpegTests(unittest.TestCase):
@@ -128,6 +156,26 @@ class AudioIoFfmpegTests(unittest.TestCase):
         pulse_ctor.assert_not_called()
         ffmpeg_ctor.assert_called_once()
         self.assertEqual(ffmpeg_ctor.call_args.kwargs["backend"], "alsa")
+
+    def test_pulse_cli_supports_monitor_stream_capture(self) -> None:
+        capture_proc = _DummyProcess(has_stdout=True, has_stdin=False)
+        playback_proc = _DummyProcess(has_stdout=False, has_stdin=True)
+        with (
+            mock.patch("gitssh.audio_io_ffmpeg._resolve_pulse_device_name", side_effect=["in_dev", "out_dev"]),
+            mock.patch("gitssh.audio_io_ffmpeg.os.set_blocking"),
+            mock.patch("gitssh.audio_io_ffmpeg.subprocess.Popen", side_effect=[capture_proc, playback_proc]) as popen_mock,
+        ):
+            io_obj = PulseCliAudioDuplexIO(
+                input_device="@DEFAULT_MONITOR@",
+                output_device="out_dev",
+                monitor_stream_index=123,
+                sample_rate=48000,
+                read_timeout=0.01,
+                write_timeout=0.05,
+            )
+            capture_cmd = popen_mock.call_args_list[0].args[0]
+            self.assertIn("--monitor-stream=123", capture_cmd)
+            io_obj.close()
 
 
 if __name__ == "__main__":

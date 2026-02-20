@@ -129,6 +129,13 @@ def _resolve_default_pulse_device(kind: str) -> str:
 
 def _resolve_pulse_device_name(*, kind: str, requested: str, arg_name: str) -> str:
     value = (requested or "").strip()
+    special_tokens = {
+        "source": {"@DEFAULT_SOURCE@", "@DEFAULT_MONITOR@"},
+        "sink": {"@DEFAULT_SINK@"},
+    }
+    if value in special_tokens.get(kind, set()):
+        return value
+
     if not value or value == "default":
         resolved = _resolve_default_pulse_device(kind)
     else:
@@ -448,6 +455,7 @@ class PulseCliAudioDuplexIO:
         *,
         input_device: str,
         output_device: str,
+        monitor_stream_index: int | None = None,
         sample_rate: int,
         read_timeout: float,
         write_timeout: float,
@@ -460,12 +468,12 @@ class PulseCliAudioDuplexIO:
         resolved_input = _resolve_pulse_device_name(
             kind="source",
             requested=input_device,
-            arg_name="--audio-input-device",
+            arg_name="capture source",
         )
         resolved_output = _resolve_pulse_device_name(
             kind="sink",
             requested=output_device,
-            arg_name="--audio-output-device",
+            arg_name="playback sink",
         )
 
         capture_cmd = [
@@ -477,6 +485,8 @@ class PulseCliAudioDuplexIO:
             "--latency-msec=30",
             f"--device={resolved_input}",
         ]
+        if monitor_stream_index is not None:
+            capture_cmd.append(f"--monitor-stream={max(monitor_stream_index, 0)}")
         playback_cmd = [
             pacat_bin,
             "--raw",

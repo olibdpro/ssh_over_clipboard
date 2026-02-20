@@ -185,99 +185,62 @@ Notes:
 Audio-modem transport tunnels protocol messages through PCM audio streams.
 This is intended for environments where microphone/audio channels are available (for example PCoIP).
 
-Client host setup:
-
-```bash
-sshg-audio-setup create-client-devices
-sshg-audio-setup status
-```
-
-Optional VM/server-side setup:
-
-```bash
-sshg-audio-setup create-server-devices
-sshg-audio-setup status
-```
-
-Probe audio capture/playback:
-
-```bash
-sshg-audio-probe --duration 5 --tx --rx
-sshg-audio-probe --list-backends
-```
-
-Naming rules for fixed routing:
-- Canonical role names: `server_output_receiver`, `client_response_sender`, `client_output_receiver`, `server_response_sender`.
-- Pass role aliases without suffix in CLI flags. `--audio-backend` resolves to concrete names (`*_pulse` or `*_alsa`).
-- For Pulse backends (`pulse-cli`, `pulse`, `pipewire`, `auto`), input aliases resolve to `<alias>_pulse.monitor` automatically.
-- `sshg-audio-setup` provisions Pulse sinks only; ALSA names are treated as literal ALSA PCM identifiers.
-
-Probe explicit client-side Pulse devices created by `sshg-audio-setup`:
-
-```bash
-sshg-audio-probe --tx --rx --duration 5 \
-  --audio-backend pulse-cli \
-  --input-device server_output_receiver \
-  --output-device client_response_sender
-```
-
-Probe explicit server-side Pulse devices created by `sshg-audio-setup`:
-
-```bash
-sshg-audio-probe --tx --rx --duration 5 \
-  --audio-backend pulse-cli \
-  --input-device client_output_receiver \
-  --output-device server_response_sender
-```
+Current routing model (Pulse-only):
+- `sshgd` captures from the server default microphone and plays to the server default speakers.
+- `sshg` captures one active client app playback stream and writes server audio to a client virtual microphone source.
+- `--audio-backend` must be `pulse-cli`.
 
 Run server in VM:
 
 ```bash
 sshgd -v \
   --transport audio-modem \
-  --audio-backend pulse-cli \
-  --audio-input-device client_output_receiver \
-  --audio-output-device server_response_sender
+  --audio-backend pulse-cli
 ```
 
-Run client on host:
+Run client on host (interactive stream prompt):
+
+```bash
+sshg localhost \
+  --transport audio-modem \
+  --audio-backend pulse-cli
+```
+
+Non-interactive client runs must preselect a stream:
 
 ```bash
 sshg localhost \
   --transport audio-modem \
   --audio-backend pulse-cli \
-  --audio-input-device server_output_receiver \
-  --audio-output-device client_response_sender
+  --audio-stream-index 42
 ```
 
-If `--audio-input-device` and `--audio-output-device` are both omitted, `sshg` and `sshgd` run an auto-discovery sequence:
-- warns you to lower speaker volume,
-- asks for confirmation before probes start,
-- sends/listens discovery pings on all detected input and output devices in parallel,
-- prints the selected `--audio-input-device` / `--audio-output-device` flags to reuse next time.
-- requires an interactive terminal for confirmation (non-interactive runs should pass both device flags explicitly).
+or by regex match:
 
-If you prefer fixed routing, pass both flags explicitly.
+```bash
+sshg localhost \
+  --transport audio-modem \
+  --audio-backend pulse-cli \
+  --audio-stream-match 'chrome|firefox'
+```
+
+Optional diagnostics:
+
+```bash
+sshg-audio-probe --duration 5 --tx --rx
+```
 
 Troubleshooting:
-- If `sshg-audio-probe` reports ffmpeg capture/playback exit, rerun with explicit `--input-device` and `--output-device`.
-- Run `pactl list short sources` / `pactl list short sinks` and select concrete device names.
-- Backend auto mode prefers `pulse-cli` (`parec`/`pacat`) and falls back to ffmpeg if pulse-cli is unavailable.
-- You can force a backend: `--audio-backend pulse-cli` or an ffmpeg format backend such as `--audio-backend alsa` (if available).
-- Legacy `sshg_*` audio device names are no longer accepted; use role aliases and let `--audio-backend` select concrete names.
+- If `sshg` reports no active playback streams, start playback in the target app and retry.
+- For non-interactive usage, pass `--audio-stream-index` or `--audio-stream-match`.
+- Ensure `pactl`, `parec`, and `pacat` are installed and accessible.
+- Inspect streams/devices with `pactl -f json list sink-inputs`, `pactl list short sources`, and `pactl list short sinks`.
 
 Useful reliability knobs:
 - `--audio-modulation` (`auto`, `robust-v1`, `legacy`; default `auto`)
-  - `auto` tries `robust-v1` first during discovery, then falls back to `legacy`.
 - `--audio-byte-repeat` (simple error-correction repeat factor, default `3`)
 - `--audio-ack-timeout-ms` / `--audio-max-retries`
 - `--audio-marker-run` (frame delimiter marker length)
-- Auto-discovery tuning:
-  - `--audio-discovery-timeout`
-  - `--audio-discovery-ping-interval-ms`
-  - `--audio-discovery-found-interval-ms`
-  - `--audio-discovery-candidate-grace`
-  - `--audio-discovery-max-silent-seconds`
 
 ## Protocol Notes
 
@@ -332,7 +295,7 @@ Audio-modem transport details:
 - Google Drive transport requires internet access, Google OAuth credentials, and initial interactive consent.
 - USB serial transport requires both peers to access the same forwarded serial channel.
 - USB gadget emulation requires root and Linux gadget-capable hardware on the emulating side.
-- Audio-modem transport requires ffmpeg and PulseAudio/PipeWire routing support.
+- Audio-modem transport requires PulseAudio/PipeWire routing support with `pactl`, `parec`, and `pacat`.
 - Audio DSP (AGC/noise suppression/echo cancellation) can reduce reliability; tune remoting audio settings when possible.
 
 ## Testing

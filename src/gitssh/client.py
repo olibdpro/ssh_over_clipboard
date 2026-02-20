@@ -8,7 +8,6 @@ import binascii
 from dataclasses import dataclass
 import os
 import select
-import shlex
 import shutil
 import signal
 import sys
@@ -32,10 +31,13 @@ from .google_drive_transport import (
     GoogleDriveTransportBackend,
     GoogleDriveTransportConfig,
 )
-from .audio_device_discovery import AudioDiscoveryConfig, discover_audio_devices
-from .audio_device_names import AudioDeviceNameError, resolve_input_device_name, resolve_output_device_name
-from .audio_io_ffmpeg import AudioIOError
+from .audio_io_ffmpeg import PulseCliAudioDuplexIO
 from .audio_modem_transport import AudioModemTransportBackend, AudioModemTransportConfig
+from .audio_pulse_runtime import (
+    ClientVirtualMicManager,
+    PulseRuntimeError,
+    resolve_client_capture_stream_index,
+)
 from .protocol import Message, build_message
 from .transport import TransportBackend, TransportError
 from .usb_serial_transport import USBSerialTransportBackend, USBSerialTransportConfig
@@ -54,6 +56,45 @@ class ClientConfig:
     resize_debounce: float = 0.1
     no_raw: bool = False
     verbose: bool = False
+
+
+class _CloseHookTransportBackend:
+    def __init__(self, backend: TransportBackend, *, on_close: Callable[[], None]) -> None:
+        self._backend = backend
+        self._on_close = on_close
+        self._closed = False
+
+    def name(self) -> str:
+        return self._backend.name()
+
+    def snapshot_inbound_cursor(self) -> str | None:
+        return self._backend.snapshot_inbound_cursor()
+
+    def read_inbound_messages(self, cursor: str | None) -> tuple[list[Message], str | None]:
+        return self._backend.read_inbound_messages(cursor)
+
+    def fetch_inbound(self) -> None:
+        self._backend.fetch_inbound()
+
+    def write_outbound_message(self, message: Message) -> str:
+        return self._backend.write_outbound_message(message)
+
+    def push_outbound(self) -> None:
+        self._backend.push_outbound()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        close_error: Exception | None = None
+        try:
+            self._backend.close()
+        except Exception as exc:  # pragma: no cover - delegated backend path
+            close_error = exc
+        finally:
+            self._on_close()
+        if close_error is not None:
+            raise close_error
 
 
 class GitSSHClient:
@@ -566,21 +607,20 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Do not apply raw termios settings to serial fd (debug/testing)",
     )
     parser.add_argument(
-        "--audio-input-device",
+        "--audio-stream-index",
+        type=int,
         default=None,
         help=(
-            "Input capture device (role alias or concrete backend device name). "
-            "Role aliases are backend-agnostic and resolved via --audio-backend. "
-            "Omit with output to auto-discover."
+            "Pulse sink-input index to capture on the client. "
+            "If omitted, sshg prompts to choose from active playback streams."
         ),
     )
     parser.add_argument(
-        "--audio-output-device",
+        "--audio-stream-match",
         default=None,
         help=(
-            "Output playback device (role alias or concrete backend device name). "
-            "Role aliases are backend-agnostic and resolved via --audio-backend. "
-            "Omit with input to auto-discover."
+            "Regex used to auto-select one active client playback stream "
+            "(matched against app/media/binary/pid/sink fields)."
         ),
     )
     parser.add_argument(
@@ -639,43 +679,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--audio-backend",
-        default="auto",
-        help="Audio backend for --transport audio-modem (auto, pulse-cli, or ffmpeg format name)",
-    )
-    parser.add_argument(
-        "--audio-ffmpeg-bin",
-        default="ffmpeg",
-        help="ffmpeg executable path for --transport audio-modem",
-    )
-    parser.add_argument(
-        "--audio-discovery-timeout",
-        type=float,
-        default=90.0,
-        help="Maximum seconds to wait for audio device auto-discovery",
-    )
-    parser.add_argument(
-        "--audio-discovery-ping-interval-ms",
-        type=int,
-        default=120,
-        help="Milliseconds between discovery ping probes per output device",
-    )
-    parser.add_argument(
-        "--audio-discovery-found-interval-ms",
-        type=int,
-        default=120,
-        help="Milliseconds between discovery found-confirmation retransmits",
-    )
-    parser.add_argument(
-        "--audio-discovery-candidate-grace",
-        type=float,
-        default=20.0,
-        help="Extra seconds to wait for final discovery acknowledgement after selecting a candidate pair",
-    )
-    parser.add_argument(
-        "--audio-discovery-max-silent-seconds",
-        type=float,
-        default=10.0,
-        help="Seconds before pending discovery ping nonces are considered stale",
+        default="pulse-cli",
+        help="Audio backend for --transport audio-modem (must be pulse-cli)",
     )
     parser.add_argument(
         "--poll-interval-ms",
@@ -755,88 +760,68 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
         )
 
     if args.transport == "audio-modem":
-        input_device = _normalize_audio_device_arg(args.audio_input_device)
-        output_device = _normalize_audio_device_arg(args.audio_output_device)
-        selected_modulation = args.audio_modulation
-
-        if (input_device is None) != (output_device is None):
+        requested_backend = (args.audio_backend or "").strip().lower()
+        if requested_backend != "pulse-cli":
             raise TransportError(
-                "For --transport audio-modem, pass both --audio-input-device and --audio-output-device "
-                "or omit both to use automatic discovery."
+                f"--transport audio-modem supports only --audio-backend pulse-cli in this build "
+                f"(received {args.audio_backend!r})."
             )
 
-        if input_device is None and output_device is None:
-            _confirm_audio_discovery("sshg")
-            discovery_logger = (
-                (lambda text: print(f"[sshg] {text}", file=sys.stderr)) if args.verbose else None
+        try:
+            stream_index = resolve_client_capture_stream_index(
+                stream_index=args.audio_stream_index,
+                stream_match=args.audio_stream_match,
+                interactive=sys.stdin.isatty(),
+                input_stream=sys.stdin,
+                output_stream=sys.stderr,
             )
-            try:
-                discovered = discover_audio_devices(
-                    AudioDiscoveryConfig(
-                        ffmpeg_bin=args.audio_ffmpeg_bin,
-                        audio_backend=args.audio_backend,
-                        sample_rate=max(args.audio_sample_rate, 8000),
-                        read_timeout=max(args.audio_read_timeout_ms / 1000.0, 0.0),
-                        write_timeout=max(args.audio_write_timeout_ms / 1000.0, 0.001),
-                        ping_interval=max(args.audio_discovery_ping_interval_ms / 1000.0, 0.01),
-                        found_interval=max(args.audio_discovery_found_interval_ms / 1000.0, 0.01),
-                        timeout=max(args.audio_discovery_timeout, 1.0),
-                        candidate_grace=max(args.audio_discovery_candidate_grace, 0.0),
-                        max_silent_seconds=max(args.audio_discovery_max_silent_seconds, 1.0),
-                        byte_repeat=max(args.audio_byte_repeat, 1),
-                        marker_run=max(args.audio_marker_run, 4),
-                        audio_modulation=args.audio_modulation,
-                    ),
-                    logger=discovery_logger,
-                )
-            except AudioIOError as exc:
-                raise TransportError(f"Audio auto-discovery failed: {exc}") from exc
+        except PulseRuntimeError as exc:
+            raise TransportError(str(exc)) from exc
 
-            input_device = discovered.input_device
-            output_device = discovered.output_device
-            selected_modulation = discovered.modulation
+        virtual_mic = ClientVirtualMicManager()
+        try:
+            route = virtual_mic.ensure_ready()
+        except PulseRuntimeError as exc:
+            raise TransportError(f"Failed to prepare client virtual microphone: {exc}") from exc
+
+        if args.verbose:
+            print(f"[sshg] capturing client playback stream index={stream_index}", file=sys.stderr)
             print(
-                "sshg: auto-selected audio devices. Reuse with: "
-                f"--audio-input-device {shlex.quote(input_device)} "
-                f"--audio-output-device {shlex.quote(output_device)} "
-                f"--audio-modulation {shlex.quote(selected_modulation)}",
+                "[sshg] routing server->client audio to virtual mic "
+                f"source={route.source_name} sink={route.sink_name}",
                 file=sys.stderr,
             )
-        else:
-            assert input_device is not None
-            assert output_device is not None
-            try:
-                input_device = resolve_input_device_name(
-                    requested=input_device,
-                    backend=args.audio_backend,
-                )
-                output_device = resolve_output_device_name(
-                    requested=output_device,
-                    backend=args.audio_backend,
-                )
-            except AudioDeviceNameError as exc:
-                raise TransportError(str(exc)) from exc
 
-        assert input_device is not None
-        assert output_device is not None
-        return AudioModemTransportBackend(
-            AudioModemTransportConfig(
-                input_device=input_device,
-                output_device=output_device,
-                sample_rate=max(args.audio_sample_rate, 8000),
-                read_timeout=max(args.audio_read_timeout_ms / 1000.0, 0.0),
-                write_timeout=max(args.audio_write_timeout_ms / 1000.0, 0.001),
-                frame_max_bytes=max(args.audio_frame_max_bytes, 1024),
-                ack_timeout=max(args.audio_ack_timeout_ms / 1000.0, 0.01),
-                max_retries=max(args.audio_max_retries, 1),
-                byte_repeat=max(args.audio_byte_repeat, 1),
-                marker_run=max(args.audio_marker_run, 4),
-                audio_modulation=selected_modulation,
-                ffmpeg_bin=args.audio_ffmpeg_bin,
-                audio_backend=args.audio_backend,
-                verbose=args.verbose,
+        try:
+            backend = AudioModemTransportBackend(
+                AudioModemTransportConfig(
+                    input_device="@DEFAULT_MONITOR@",
+                    output_device=route.sink_name,
+                    sample_rate=max(args.audio_sample_rate, 8000),
+                    read_timeout=max(args.audio_read_timeout_ms / 1000.0, 0.0),
+                    write_timeout=max(args.audio_write_timeout_ms / 1000.0, 0.001),
+                    frame_max_bytes=max(args.audio_frame_max_bytes, 1024),
+                    ack_timeout=max(args.audio_ack_timeout_ms / 1000.0, 0.01),
+                    max_retries=max(args.audio_max_retries, 1),
+                    byte_repeat=max(args.audio_byte_repeat, 1),
+                    marker_run=max(args.audio_marker_run, 4),
+                    audio_modulation=args.audio_modulation,
+                    audio_backend="pulse-cli",
+                    verbose=args.verbose,
+                    io_factory=lambda config: PulseCliAudioDuplexIO(
+                        input_device="@DEFAULT_MONITOR@",
+                        output_device=route.sink_name,
+                        monitor_stream_index=stream_index,
+                        sample_rate=max(config.sample_rate, 8000),
+                        read_timeout=max(config.read_timeout, 0.0),
+                        write_timeout=max(config.write_timeout, 0.001),
+                    ),
+                )
             )
-        )
+        except Exception:
+            virtual_mic.close()
+            raise
+        return _CloseHookTransportBackend(backend, on_close=virtual_mic.close)
 
     if args.transport == "google-drive":
         client_secrets = (args.drive_client_secrets or "").strip()
@@ -862,36 +847,6 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
         outbound_branch=args.branch_c2s,
         auto_init_local=True,
     )
-
-
-def _normalize_audio_device_arg(value: str | None) -> str | None:
-    if value is None:
-        return None
-    cleaned = value.strip()
-    return cleaned or None
-
-
-def _confirm_audio_discovery(program: str) -> None:
-    print(
-        f"{program}: audio auto-discovery will send probe tones on all detected input and output devices in parallel.",
-        file=sys.stderr,
-    )
-    print(
-        f"{program}: lower your speaker/headphone volume before continuing.",
-        file=sys.stderr,
-    )
-    if not sys.stdin.isatty():
-        raise TransportError(
-            "Audio auto-discovery requires interactive confirmation. "
-            "Specify --audio-input-device and --audio-output-device explicitly."
-        )
-
-    print(f"{program}: continue with device discovery? [y/N]: ", end="", file=sys.stderr, flush=True)
-    response = sys.stdin.readline()
-    if response.strip().lower() not in {"y", "yes"}:
-        raise TransportError("Audio auto-discovery cancelled by user")
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
