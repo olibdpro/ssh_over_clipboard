@@ -6,7 +6,6 @@ import errno
 import os
 import select
 import subprocess
-from typing import Dict
 from typing import Protocol
 
 
@@ -25,6 +24,132 @@ class AudioDuplexIO(Protocol):
 
     def close(self) -> None:
         ...
+
+
+def _run_pactl(args: list[str]) -> tuple[int, str, str]:
+    try:
+        result = subprocess.run(
+            ["pactl", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except FileNotFoundError as exc:
+        raise AudioIOError(
+            "pactl executable not found; install pulseaudio-utils or pass explicit Pulse device names"
+        ) from exc
+    except Exception as exc:
+        raise AudioIOError(f"Failed to execute pactl {' '.join(args)}: {exc}") from exc
+    return result.returncode, (result.stdout or "").strip(), (result.stderr or "").strip()
+
+
+def _parse_pactl_short_devices(output: str) -> list[str]:
+    names: list[str] = []
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        names.append(fields[1])
+    return names
+
+
+def _list_pulse_devices(kind: str) -> tuple[list[str], str]:
+    plural = "sources" if kind == "source" else "sinks"
+    code, stdout, stderr = _run_pactl(["list", "short", plural])
+    if code != 0:
+        detail = stderr or stdout or "unknown error"
+        raise AudioIOError(f"pactl list short {plural} failed: {detail}")
+    return _parse_pactl_short_devices(stdout), stdout
+
+
+def _default_device_from_pactl_info(kind: str) -> str:
+    code, stdout, stderr = _run_pactl(["info"])
+    if code != 0:
+        detail = stderr or stdout or "unknown error"
+        raise AudioIOError(f"pactl info failed: {detail}")
+
+    prefix = "Default Source:" if kind == "source" else "Default Sink:"
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if not line.startswith(prefix):
+            continue
+        value = line.split(":", 1)[1].strip()
+        if value:
+            return value
+        break
+    raise AudioIOError(f"pactl info did not report {prefix.lower()}")
+
+
+def _format_device_listing(kind: str, names: list[str], raw_output: str) -> str:
+    plural = "sources" if kind == "source" else "sinks"
+    if names:
+        listed = "\n".join(f"- {name}" for name in names)
+        return f"Available Pulse {plural}:\n{listed}"
+
+    trimmed = raw_output.strip()
+    if trimmed:
+        return f"Available Pulse {plural} (raw):\n{trimmed}"
+    return f"No Pulse {plural} were reported by pactl."
+
+
+def _resolve_default_pulse_device(kind: str) -> str:
+    subcmd = "get-default-source" if kind == "source" else "get-default-sink"
+
+    code, stdout, stderr = _run_pactl([subcmd])
+    if code == 0 and stdout:
+        return stdout
+    get_default_detail = stderr or stdout or "unknown error"
+
+    try:
+        return _default_device_from_pactl_info(kind)
+    except AudioIOError as info_exc:
+        names: list[str] = []
+        raw_devices = ""
+        list_error = ""
+        try:
+            names, raw_devices = _list_pulse_devices(kind)
+        except AudioIOError as list_exc:
+            list_error = str(list_exc)
+
+        lines = [
+            f"Unable to resolve default Pulse {kind}.",
+            f"`pactl {subcmd}` failed: {get_default_detail}",
+            f"`pactl info` fallback failed: {info_exc}",
+        ]
+        if list_error:
+            lines.append(f"Could not list available Pulse devices: {list_error}")
+        else:
+            lines.append(_format_device_listing(kind, names, raw_devices))
+        raise AudioIOError("\n".join(lines)) from info_exc
+
+
+def _resolve_pulse_device_name(*, kind: str, requested: str, arg_name: str) -> str:
+    value = (requested or "").strip()
+    if not value or value == "default":
+        resolved = _resolve_default_pulse_device(kind)
+    else:
+        resolved = value
+
+    names: list[str] = []
+    raw_devices = ""
+    try:
+        names, raw_devices = _list_pulse_devices(kind)
+    except AudioIOError:
+        return resolved
+
+    if names and resolved not in names:
+        lines = [
+            f"Pulse {kind} '{resolved}' was not found for `{arg_name}`.",
+            _format_device_listing(kind, names, raw_devices),
+        ]
+        if value in {"", "default"}:
+            lines.append(f"`{arg_name}` resolved to '{resolved}' from the Pulse default device.")
+        raise AudioIOError("\n".join(lines))
+
+    return resolved
 
 
 def _process_stderr(proc: subprocess.Popen[bytes] | subprocess.Popen[str], label: str) -> str:
@@ -321,13 +446,24 @@ class PulseCliAudioDuplexIO:
         self.read_timeout = max(read_timeout, 0.0)
         self.write_timeout = max(write_timeout, 0.0)
 
+        resolved_input = _resolve_pulse_device_name(
+            kind="source",
+            requested=input_device,
+            arg_name="--audio-input-device",
+        )
+        resolved_output = _resolve_pulse_device_name(
+            kind="sink",
+            requested=output_device,
+            arg_name="--audio-output-device",
+        )
+
         capture_cmd = [
             parec_bin,
             "--raw",
             "--channels=1",
             f"--rate={sample_rate}",
             "--format=s16le",
-            f"--device={input_device}",
+            f"--device={resolved_input}",
         ]
         playback_cmd = [
             pacat_bin,
@@ -336,7 +472,7 @@ class PulseCliAudioDuplexIO:
             "--channels=1",
             f"--rate={sample_rate}",
             "--format=s16le",
-            f"--device={output_device}",
+            f"--device={resolved_output}",
         ]
 
         try:
