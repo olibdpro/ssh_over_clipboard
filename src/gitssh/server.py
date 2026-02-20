@@ -24,6 +24,12 @@ from .git_transport import (
     DEFAULT_BRANCH_S2C,
     GitTransportBackend,
 )
+from .google_drive_transport import (
+    DEFAULT_DRIVE_LOG_C2S,
+    DEFAULT_DRIVE_LOG_S2C,
+    GoogleDriveTransportBackend,
+    GoogleDriveTransportConfig,
+)
 from .audio_device_discovery import AudioDiscoveryConfig, discover_audio_devices
 from .audio_device_names import AudioDeviceNameError, resolve_input_device_name, resolve_output_device_name
 from .audio_io_ffmpeg import AudioIOError
@@ -506,7 +512,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logs")
     parser.add_argument(
         "--transport",
-        choices=["git", "usb-serial", "audio-modem"],
+        choices=["git", "usb-serial", "audio-modem", "google-drive"],
         default="git",
         help="Transport backend",
     )
@@ -529,6 +535,32 @@ def _build_parser() -> argparse.ArgumentParser:
         "--branch-s2c",
         default=DEFAULT_BRANCH_S2C,
         help="Branch used for server-to-client frames",
+    )
+    parser.add_argument(
+        "--drive-client-secrets",
+        default=None,
+        help="Path to Google OAuth client-secrets JSON used by --transport google-drive",
+    )
+    parser.add_argument(
+        "--drive-token-path",
+        default="~/.config/clipssh/drive-token.json",
+        help="Path to cached Google OAuth token JSON used by --transport google-drive",
+    )
+    parser.add_argument(
+        "--drive-c2s-file-name",
+        default=DEFAULT_DRIVE_LOG_C2S,
+        help="Google Drive appData file name used for client-to-server frames",
+    )
+    parser.add_argument(
+        "--drive-s2c-file-name",
+        default=DEFAULT_DRIVE_LOG_S2C,
+        help="Google Drive appData file name used for server-to-client frames",
+    )
+    parser.add_argument(
+        "--drive-poll-page-size",
+        type=int,
+        default=200,
+        help="Page size for Google Drive file lookup queries",
     )
     parser.add_argument(
         "--serial-port",
@@ -828,6 +860,23 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
                 ffmpeg_bin=args.audio_ffmpeg_bin,
                 audio_backend=args.audio_backend,
                 verbose=args.verbose,
+            )
+        )
+
+    if args.transport == "google-drive":
+        client_secrets = (args.drive_client_secrets or "").strip()
+        if not client_secrets:
+            raise TransportError(
+                "For --transport google-drive, pass --drive-client-secrets /path/to/client_secrets.json"
+            )
+
+        return GoogleDriveTransportBackend(
+            GoogleDriveTransportConfig(
+                client_secrets_path=client_secrets,
+                token_path=args.drive_token_path,
+                inbound_file_name=args.drive_c2s_file_name,
+                outbound_file_name=args.drive_s2c_file_name,
+                poll_page_size=max(args.drive_poll_page_size, 1),
             )
         )
 

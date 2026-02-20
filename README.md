@@ -1,9 +1,10 @@
 # clipssh
 
-`clipssh` is a local client/server SSH emulator with four transports:
+`clipssh` is a local client/server SSH emulator with five transports:
 
 - clipboard transport (`sshc` + `sshcd`)
 - git transport (`sshg` + `sshgd`)
+- Google Drive transport (`sshg --transport google-drive` + `sshgd --transport google-drive`)
 - usb-serial transport (`sshg --transport usb-serial` + `sshgd --transport usb-serial`)
 - audio-modem transport (`sshg --transport audio-modem` + `sshgd --transport audio-modem`)
 
@@ -106,6 +107,38 @@ sshg localhost \
 
 Then type commands at the prompt.
 `sshg` now opens a raw interactive PTY stream (no local `input()` prompt wrapper).
+
+### Google Drive transport (OAuth appData logs)
+
+This transport mirrors the git branch model with two Google Drive `appDataFolder` log files:
+
+- `gitssh2-c2s.log` for client->server frames
+- `gitssh2-s2c.log` for server->client frames
+
+Setup:
+- Create a Google Cloud OAuth client ID for a Desktop app.
+- Download the client-secrets JSON file.
+- Use the same OAuth app and Google account on both peers.
+
+Terminal 1 (server side):
+
+```bash
+sshgd -v \
+  --transport google-drive \
+  --drive-client-secrets ~/secrets/google-drive-client.json
+```
+
+Terminal 2 (client side):
+
+```bash
+sshg localhost \
+  --transport google-drive \
+  --drive-client-secrets ~/secrets/google-drive-client.json
+```
+
+First run opens a local browser consent flow and stores a refresh token at
+`~/.config/clipssh/drive-token.json` (override with `--drive-token-path`).
+For headless runs, complete OAuth once in an interactive terminal first.
 
 ### USB serial transport
 
@@ -267,6 +300,10 @@ Git transport stores one protocol frame per commit and syncs through:
 
 Each peer keeps its own local bare mirror and continuously fetches/pushes against the upstream remote.
 
+Google Drive transport stores one protocol frame per line in two shared appData files:
+- client->server file: `gitssh2-c2s.log`
+- server->client file: `gitssh2-s2c.log`
+
 Git transport protocol details:
 - Protocol: `gitssh/2`
 - Interactive PTY message kinds: `pty_input`, `pty_output`, `pty_resize`, `pty_signal`, `pty_closed`
@@ -292,6 +329,7 @@ Audio-modem transport details:
 - Best-effort reliability via retries + de-duplication.
 - Git transport requires a local `git` executable.
 - Git transport requires both peers to have access to the same upstream bare repo URL/path.
+- Google Drive transport requires internet access, Google OAuth credentials, and initial interactive consent.
 - USB serial transport requires both peers to access the same forwarded serial channel.
 - USB gadget emulation requires root and Linux gadget-capable hardware on the emulating side.
 - Audio-modem transport requires ffmpeg and PulseAudio/PipeWire routing support.

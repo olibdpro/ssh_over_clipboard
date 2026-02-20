@@ -9,8 +9,11 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from gitssh.client import _build_backend as build_client_backend
 from gitssh.client import _build_parser as build_client_parser
+from gitssh.server import _build_backend as build_server_backend
 from gitssh.server import _build_parser as build_server_parser
+from gitssh.transport import TransportError
 
 
 class GitClientCliTests(unittest.TestCase):
@@ -87,6 +90,42 @@ class GitClientCliTests(unittest.TestCase):
         self.assertEqual(args.audio_discovery_candidate_grace, 6.0)
         self.assertEqual(args.audio_discovery_max_silent_seconds, 4.0)
 
+    def test_supports_google_drive_transport_options(self) -> None:
+        args = build_client_parser().parse_args(
+            [
+                "localhost",
+                "--transport",
+                "google-drive",
+                "--drive-client-secrets",
+                "/tmp/client-secrets.json",
+                "--drive-token-path",
+                "/tmp/drive-token.json",
+                "--drive-c2s-file-name",
+                "custom-c2s.log",
+                "--drive-s2c-file-name",
+                "custom-s2c.log",
+                "--drive-poll-page-size",
+                "250",
+            ]
+        )
+        self.assertEqual(args.transport, "google-drive")
+        self.assertEqual(args.drive_client_secrets, "/tmp/client-secrets.json")
+        self.assertEqual(args.drive_token_path, "/tmp/drive-token.json")
+        self.assertEqual(args.drive_c2s_file_name, "custom-c2s.log")
+        self.assertEqual(args.drive_s2c_file_name, "custom-s2c.log")
+        self.assertEqual(args.drive_poll_page_size, 250)
+
+    def test_google_drive_transport_requires_client_secrets(self) -> None:
+        args = build_client_parser().parse_args(
+            [
+                "localhost",
+                "--transport",
+                "google-drive",
+            ]
+        )
+        with self.assertRaises(TransportError):
+            build_client_backend(args)
+
 
 class GitServerCliTests(unittest.TestCase):
     def test_defaults_include_git_transport(self) -> None:
@@ -156,6 +195,40 @@ class GitServerCliTests(unittest.TestCase):
         self.assertEqual(args.audio_discovery_found_interval_ms, 110)
         self.assertEqual(args.audio_discovery_candidate_grace, 7.5)
         self.assertEqual(args.audio_discovery_max_silent_seconds, 5.5)
+
+    def test_supports_google_drive_transport_options(self) -> None:
+        args = build_server_parser().parse_args(
+            [
+                "--transport",
+                "google-drive",
+                "--drive-client-secrets",
+                "/tmp/client-secrets.json",
+                "--drive-token-path",
+                "/tmp/drive-token.json",
+                "--drive-c2s-file-name",
+                "custom-c2s.log",
+                "--drive-s2c-file-name",
+                "custom-s2c.log",
+                "--drive-poll-page-size",
+                "300",
+            ]
+        )
+        self.assertEqual(args.transport, "google-drive")
+        self.assertEqual(args.drive_client_secrets, "/tmp/client-secrets.json")
+        self.assertEqual(args.drive_token_path, "/tmp/drive-token.json")
+        self.assertEqual(args.drive_c2s_file_name, "custom-c2s.log")
+        self.assertEqual(args.drive_s2c_file_name, "custom-s2c.log")
+        self.assertEqual(args.drive_poll_page_size, 300)
+
+    def test_google_drive_transport_requires_client_secrets(self) -> None:
+        args = build_server_parser().parse_args(
+            [
+                "--transport",
+                "google-drive",
+            ]
+        )
+        with self.assertRaises(TransportError):
+            build_server_backend(args)
 
 
 if __name__ == "__main__":

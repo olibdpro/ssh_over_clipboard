@@ -8,7 +8,12 @@ version = "0.1.0"
 description = "Clipboard-based local SSH emulator"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+    "google-api-python-client",
+    "google-auth",
+    "google-auth-httplib2",
+    "google-auth-oauthlib",
+]
 
 [project.scripts]
 sshc = "clipssh.client:main"
