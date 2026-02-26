@@ -36,6 +36,8 @@ from .protocol import Message, build_message
 from .transport import TransportBackend, TransportError
 from .usb_serial_transport import USBSerialTransportBackend, USBSerialTransportConfig
 
+DIAG_IDLE_SESSION_ID = "00000000-0000-0000-0000-000000000001"
+
 
 @dataclass
 class ServerConfig:
@@ -229,24 +231,31 @@ class GitSSHServer:
     def _maybe_emit_diag_ping(self) -> None:
         if not self.config.diag:
             return
-        session = self._active
-        if session is None:
-            return
 
         now = time.monotonic()
         interval = max(self.config.diag_interval, 0.05)
         if now < self._next_diag_at:
             return
 
+        session = self._active
         self._diag_counter += 1
-        self._emit_diag_ping(
-            session_id=session.state.session_id,
-            phase="active_heartbeat",
-            body={
-                "diag_counter": self._diag_counter,
-                "stream_id": session.stream_id,
-            },
-        )
+        if session is None:
+            self._emit_diag_ping(
+                session_id=DIAG_IDLE_SESSION_ID,
+                phase="idle_heartbeat",
+                body={
+                    "diag_counter": self._diag_counter,
+                },
+            )
+        else:
+            self._emit_diag_ping(
+                session_id=session.state.session_id,
+                phase="active_heartbeat",
+                body={
+                    "diag_counter": self._diag_counter,
+                    "stream_id": session.stream_id,
+                },
+            )
         self._next_diag_at = now + interval
 
     def _term_size_from_connect(self, message: Message) -> tuple[int, int]:
@@ -802,7 +811,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--diag-interval-ms",
         type=int,
         default=1000,
-        help="Milliseconds between periodic diagnostic pings while a session is active",
+        help="Milliseconds between periodic diagnostic pings while --diag is enabled",
     )
     parser.add_argument(
         "--diag-connect-burst",

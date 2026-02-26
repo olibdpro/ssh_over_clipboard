@@ -197,7 +197,7 @@ sshgd -v \
   --transport audio-modem
 ```
 
-Diagnostic ping mode (server emits `diag_ping` frames for handshake/audio-path debugging):
+Diagnostic ping mode (server emits `diag_ping` frames continuously for audio-path debugging, including when idle):
 
 ```bash
 sshgd -v \
