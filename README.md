@@ -185,34 +185,36 @@ Notes:
 Audio-modem transport tunnels protocol messages through PCM audio streams.
 This is intended for environments where microphone/audio channels are available (for example PCoIP).
 
-Current routing model (Pulse-only):
-- `sshgd` captures from the server default microphone and plays to the server default speakers.
-- `sshg` captures one active client app playback stream and writes server audio to a client virtual microphone source.
-- `--audio-backend` must be `pulse-cli`.
+Current routing model:
+- `sshgd` (server) captures from the server default Pulse microphone and plays to the server default Pulse speakers.
+- `sshg` (client) uses PipeWire node selection + `pw-link` routing for capture/write.
+- `--audio-backend` is no longer exposed; backend choice is fixed by role (`sshgd` Pulse, `sshg` PipeWire-link).
 
 Run server in VM:
 
 ```bash
 sshgd -v \
-  --transport audio-modem \
-  --audio-backend pulse-cli
+  --transport audio-modem
 ```
 
-Run client on host (interactive stream prompt):
+Run client on host (interactive PipeWire node prompts):
+
+```bash
+sshg localhost \
+  --transport audio-modem
+```
+
+`sshg` now runs a PipeWire preflight before audio-modem startup and fails fast with remediation
+if no session manager / PipeWire ports are available. For advanced debugging only, this check
+can be bypassed with `--skip-pw-preflight`.
+
+Non-interactive client runs must preselect capture/write nodes:
 
 ```bash
 sshg localhost \
   --transport audio-modem \
-  --audio-backend pulse-cli
-```
-
-Non-interactive client runs must preselect a stream:
-
-```bash
-sshg localhost \
-  --transport audio-modem \
-  --audio-backend pulse-cli \
-  --audio-stream-index 42
+  --pw-capture-node-id 42 \
+  --pw-write-node-id 77
 ```
 
 or by regex match:
@@ -220,21 +222,26 @@ or by regex match:
 ```bash
 sshg localhost \
   --transport audio-modem \
-  --audio-backend pulse-cli \
-  --audio-stream-match 'chrome|firefox'
+  --pw-capture-match 'chrome|firefox|spotify' \
+  --pw-write-match 'pcoip|discord|teams'
 ```
 
 Optional diagnostics:
 
 ```bash
+sshg-audio-probe --pipewire-preflight
+sshg-audio-probe --pipewire-preflight --pw-capture-node-id 42 --pw-write-node-id 77
 sshg-audio-probe --duration 5 --tx --rx
 ```
 
 Troubleshooting:
-- If `sshg` reports no active playback streams, start playback in the target app and retry.
-- For non-interactive usage, pass `--audio-stream-index` or `--audio-stream-match`.
-- Ensure `pactl`, `parec`, and `pacat` are installed and accessible.
-- Inspect streams/devices with `pactl -f json list sink-inputs`, `pactl list short sources`, and `pactl list short sinks`.
+- If `sshg` reports no active capture/write nodes, start playback/recording in the target app and retry.
+- For non-interactive usage, pass `--pw-capture-node-id`/`--pw-capture-match` and `--pw-write-node-id`/`--pw-write-match`.
+- Run `sshg-audio-probe --pipewire-preflight` to verify PipeWire node/port visibility and session manager health.
+- Ensure `pw-cli`, `pw-link`, and `pw-cat` are installed and accessible on the client.
+- Ensure `pactl`, `parec`, and `pacat` are installed and accessible on the server.
+- Inspect client nodes/ports with `pw-cli ls Node`, `pw-link -o`, `pw-link -i`, and `pw-link -l`.
+- Inspect server defaults/devices with `pactl info`, `pactl list short sources`, and `pactl list short sinks`.
 
 Useful reliability knobs:
 - `--audio-modulation` (`auto`, `robust-v1`, `legacy`; default `auto`)
@@ -295,7 +302,7 @@ Audio-modem transport details:
 - Google Drive transport requires internet access, Google OAuth credentials, and initial interactive consent.
 - USB serial transport requires both peers to access the same forwarded serial channel.
 - USB gadget emulation requires root and Linux gadget-capable hardware on the emulating side.
-- Audio-modem transport requires PulseAudio/PipeWire routing support with `pactl`, `parec`, and `pacat`.
+- Audio-modem transport requires Pulse/PipeWire CLI routing tools (`pactl`/`parec`/`pacat` on server, `pw-cli`/`pw-link`/`pw-cat` on client).
 - Audio DSP (AGC/noise suppression/echo cancellation) can reduce reliability; tune remoting audio settings when possible.
 
 ## Testing

@@ -661,11 +661,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Audio modulation profile for --transport audio-modem",
     )
     parser.add_argument(
-        "--audio-backend",
-        default="pulse-cli",
-        help="Audio backend for --transport audio-modem (must be pulse-cli)",
-    )
-    parser.add_argument(
         "--shell",
         default="tcsh",
         help="Preferred shell executable name or path (default: tcsh)",
@@ -725,13 +720,6 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
         )
 
     if args.transport == "audio-modem":
-        requested_backend = (args.audio_backend or "").strip().lower()
-        if requested_backend != "pulse-cli":
-            raise TransportError(
-                f"--transport audio-modem supports only --audio-backend pulse-cli in this build "
-                f"(received {args.audio_backend!r})."
-            )
-
         try:
             input_device, output_device = resolve_server_default_paths()
         except PulseRuntimeError as exc:

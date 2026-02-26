@@ -15,7 +15,7 @@ import termios
 import threading
 import time
 import tty
-from typing import Any, Callable
+from typing import Any
 import uuid
 
 from sshcore.session import EndpointState
@@ -31,12 +31,13 @@ from .google_drive_transport import (
     GoogleDriveTransportBackend,
     GoogleDriveTransportConfig,
 )
-from .audio_io_ffmpeg import PulseCliAudioDuplexIO
 from .audio_modem_transport import AudioModemTransportBackend, AudioModemTransportConfig
-from .audio_pulse_runtime import (
-    ClientVirtualMicManager,
-    PulseRuntimeError,
-    resolve_client_capture_stream_index,
+from .audio_pipewire_runtime import (
+    PipeWireLinkAudioDuplexIO,
+    PipeWireRuntimeError,
+    ensure_client_pipewire_preflight,
+    resolve_client_capture_node_id,
+    resolve_client_write_node_id,
 )
 from .protocol import Message, build_message
 from .transport import TransportBackend, TransportError
@@ -56,45 +57,6 @@ class ClientConfig:
     resize_debounce: float = 0.1
     no_raw: bool = False
     verbose: bool = False
-
-
-class _CloseHookTransportBackend:
-    def __init__(self, backend: TransportBackend, *, on_close: Callable[[], None]) -> None:
-        self._backend = backend
-        self._on_close = on_close
-        self._closed = False
-
-    def name(self) -> str:
-        return self._backend.name()
-
-    def snapshot_inbound_cursor(self) -> str | None:
-        return self._backend.snapshot_inbound_cursor()
-
-    def read_inbound_messages(self, cursor: str | None) -> tuple[list[Message], str | None]:
-        return self._backend.read_inbound_messages(cursor)
-
-    def fetch_inbound(self) -> None:
-        self._backend.fetch_inbound()
-
-    def write_outbound_message(self, message: Message) -> str:
-        return self._backend.write_outbound_message(message)
-
-    def push_outbound(self) -> None:
-        self._backend.push_outbound()
-
-    def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        close_error: Exception | None = None
-        try:
-            self._backend.close()
-        except Exception as exc:  # pragma: no cover - delegated backend path
-            close_error = exc
-        finally:
-            self._on_close()
-        if close_error is not None:
-            raise close_error
 
 
 class GitSSHClient:
@@ -607,21 +569,43 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Do not apply raw termios settings to serial fd (debug/testing)",
     )
     parser.add_argument(
-        "--audio-stream-index",
+        "--pw-capture-node-id",
         type=int,
         default=None,
         help=(
-            "Pulse sink-input index to capture on the client. "
-            "If omitted, sshg prompts to choose from active playback streams."
+            "PipeWire node id to capture on the client. "
+            "If omitted, sshg prompts to choose from active capture candidates."
         ),
     )
     parser.add_argument(
-        "--audio-stream-match",
+        "--pw-capture-match",
         default=None,
         help=(
-            "Regex used to auto-select one active client playback stream "
-            "(matched against app/media/binary/pid/sink fields)."
+            "Regex used to auto-select one active client capture node "
+            "(matched against id/name/description/app/class fields)."
         ),
+    )
+    parser.add_argument(
+        "--pw-write-node-id",
+        type=int,
+        default=None,
+        help=(
+            "PipeWire node id to route server audio into on the client. "
+            "If omitted, sshg prompts to choose from active write candidates."
+        ),
+    )
+    parser.add_argument(
+        "--pw-write-match",
+        default=None,
+        help=(
+            "Regex used to auto-select one active client write node "
+            "(matched against id/name/description/app/class fields)."
+        ),
+    )
+    parser.add_argument(
+        "--skip-pw-preflight",
+        action="store_true",
+        help="Skip PipeWire client preflight checks before audio-modem startup (debug only).",
     )
     parser.add_argument(
         "--audio-sample-rate",
@@ -676,11 +660,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default="auto",
         choices=["auto", "legacy", "robust-v1"],
         help="Audio modulation profile for --transport audio-modem",
-    )
-    parser.add_argument(
-        "--audio-backend",
-        default="pulse-cli",
-        help="Audio backend for --transport audio-modem (must be pulse-cli)",
     )
     parser.add_argument(
         "--poll-interval-ms",
@@ -760,68 +739,68 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
         )
 
     if args.transport == "audio-modem":
-        requested_backend = (args.audio_backend or "").strip().lower()
-        if requested_backend != "pulse-cli":
-            raise TransportError(
-                f"--transport audio-modem supports only --audio-backend pulse-cli in this build "
-                f"(received {args.audio_backend!r})."
-            )
+        if not args.skip_pw_preflight:
+            try:
+                ensure_client_pipewire_preflight(
+                    capture_node_id=args.pw_capture_node_id,
+                    write_node_id=args.pw_write_node_id,
+                )
+            except PipeWireRuntimeError as exc:
+                raise TransportError(str(exc)) from exc
+            if args.verbose:
+                print("[sshg] PipeWire preflight passed", file=sys.stderr)
 
         try:
-            stream_index = resolve_client_capture_stream_index(
-                stream_index=args.audio_stream_index,
-                stream_match=args.audio_stream_match,
+            capture_node_id = resolve_client_capture_node_id(
+                node_id=args.pw_capture_node_id,
+                node_match=args.pw_capture_match,
                 interactive=sys.stdin.isatty(),
                 input_stream=sys.stdin,
                 output_stream=sys.stderr,
             )
-        except PulseRuntimeError as exc:
+            write_node_id = resolve_client_write_node_id(
+                node_id=args.pw_write_node_id,
+                node_match=args.pw_write_match,
+                interactive=sys.stdin.isatty(),
+                input_stream=sys.stdin,
+                output_stream=sys.stderr,
+            )
+        except PipeWireRuntimeError as exc:
             raise TransportError(str(exc)) from exc
 
-        virtual_mic = ClientVirtualMicManager()
-        try:
-            route = virtual_mic.ensure_ready()
-        except PulseRuntimeError as exc:
-            raise TransportError(f"Failed to prepare client virtual microphone: {exc}") from exc
-
         if args.verbose:
-            print(f"[sshg] capturing client playback stream index={stream_index}", file=sys.stderr)
+            print(f"[sshg] selected PipeWire capture node id={capture_node_id}", file=sys.stderr)
+            print(f"[sshg] selected PipeWire write node id={write_node_id}", file=sys.stderr)
             print(
-                "[sshg] routing server->client audio to virtual mic "
-                f"source={route.source_name} sink={route.sink_name}",
+                "[sshg] using PipeWire link routing for client audio-modem I/O "
+                f"(capture-node={capture_node_id}, write-node={write_node_id})",
                 file=sys.stderr,
             )
 
-        try:
-            backend = AudioModemTransportBackend(
-                AudioModemTransportConfig(
-                    input_device="@DEFAULT_MONITOR@",
-                    output_device=route.sink_name,
-                    sample_rate=max(args.audio_sample_rate, 8000),
-                    read_timeout=max(args.audio_read_timeout_ms / 1000.0, 0.0),
-                    write_timeout=max(args.audio_write_timeout_ms / 1000.0, 0.001),
-                    frame_max_bytes=max(args.audio_frame_max_bytes, 1024),
-                    ack_timeout=max(args.audio_ack_timeout_ms / 1000.0, 0.01),
-                    max_retries=max(args.audio_max_retries, 1),
-                    byte_repeat=max(args.audio_byte_repeat, 1),
-                    marker_run=max(args.audio_marker_run, 4),
-                    audio_modulation=args.audio_modulation,
-                    audio_backend="pulse-cli",
-                    verbose=args.verbose,
-                    io_factory=lambda config: PulseCliAudioDuplexIO(
-                        input_device="@DEFAULT_MONITOR@",
-                        output_device=route.sink_name,
-                        monitor_stream_index=stream_index,
-                        sample_rate=max(config.sample_rate, 8000),
-                        read_timeout=max(config.read_timeout, 0.0),
-                        write_timeout=max(config.write_timeout, 0.001),
-                    ),
-                )
+        return AudioModemTransportBackend(
+            AudioModemTransportConfig(
+                input_device=f"pw-node:{capture_node_id}",
+                output_device=f"pw-node:{write_node_id}",
+                sample_rate=max(args.audio_sample_rate, 8000),
+                read_timeout=max(args.audio_read_timeout_ms / 1000.0, 0.0),
+                write_timeout=max(args.audio_write_timeout_ms / 1000.0, 0.001),
+                frame_max_bytes=max(args.audio_frame_max_bytes, 1024),
+                ack_timeout=max(args.audio_ack_timeout_ms / 1000.0, 0.01),
+                max_retries=max(args.audio_max_retries, 1),
+                byte_repeat=max(args.audio_byte_repeat, 1),
+                marker_run=max(args.audio_marker_run, 4),
+                audio_modulation=args.audio_modulation,
+                audio_backend="pipewire-link",
+                verbose=args.verbose,
+                io_factory=lambda config: PipeWireLinkAudioDuplexIO(
+                    capture_node_id=capture_node_id,
+                    write_node_id=write_node_id,
+                    sample_rate=max(config.sample_rate, 8000),
+                    read_timeout=max(config.read_timeout, 0.0),
+                    write_timeout=max(config.write_timeout, 0.001),
+                ),
             )
-        except Exception:
-            virtual_mic.close()
-            raise
-        return _CloseHookTransportBackend(backend, on_close=virtual_mic.close)
+        )
 
     if args.transport == "google-drive":
         client_secrets = (args.drive_client_secrets or "").strip()

@@ -19,10 +19,28 @@ from .audio_io_ffmpeg import (
     _format_duplex_backends,
     build_audio_duplex_io,
 )
+from .audio_pipewire_runtime import build_client_pipewire_preflight_report
 
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="sshg-audio-probe", description="Probe ffmpeg audio capture/playback paths")
+    parser.add_argument(
+        "--pipewire-preflight",
+        action="store_true",
+        help="Run PipeWire client preflight checks and exit",
+    )
+    parser.add_argument(
+        "--pw-capture-node-id",
+        type=int,
+        default=None,
+        help="Optional capture node id to validate during PipeWire preflight",
+    )
+    parser.add_argument(
+        "--pw-write-node-id",
+        type=int,
+        default=None,
+        help="Optional write node id to validate during PipeWire preflight",
+    )
     parser.add_argument(
         "--input-device",
         default="default",
@@ -68,6 +86,18 @@ def _tone_chunk(*, sample_rate: int, frequency_hz: float, frames: int, phase0: f
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+
+    if args.pipewire_preflight:
+        report = build_client_pipewire_preflight_report(
+            capture_node_id=args.pw_capture_node_id,
+            write_node_id=args.pw_write_node_id,
+        )
+        rendered = report.render()
+        if report.ok:
+            print(rendered)
+            return 0
+        print(f"sshg-audio-probe: {rendered}", file=sys.stderr)
+        return 2
 
     if args.list_backends:
         try:

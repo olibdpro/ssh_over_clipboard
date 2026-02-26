@@ -15,10 +15,15 @@ from gitssh.audio_pulse_runtime import (  # noqa: E402
     CLIENT_VIRTUAL_MIC_SOURCE,
     ClientVirtualMicManager,
     PulsePlaybackStream,
+    PulseRecordStream,
     PulseRuntimeError,
+    describe_record_stream,
     describe_stream,
     list_active_playback_streams,
+    list_active_record_streams,
+    move_source_output_to_source,
     resolve_client_capture_stream_index,
+    resolve_client_write_stream_index,
     resolve_server_default_paths,
 )
 
@@ -70,6 +75,28 @@ class PulseStreamDiscoveryTests(unittest.TestCase):
         self.assertEqual(streams[0].app_name, "Chrome")
         self.assertEqual(streams[1].process_id, 1234)
         run_pactl.assert_called_once_with(["-f", "json", "list", "sink-inputs"])
+
+    def test_list_active_playback_streams_accepts_missing_state_field(self) -> None:
+        payload = """
+[
+  {
+    "index": 12,
+    "sink": 1,
+    "corked": false,
+    "properties": {
+      "application.name": "spotify",
+      "media.name": "Spotify",
+      "application.process.binary": "spotify"
+    }
+  }
+]
+"""
+        with mock.patch("gitssh.audio_pulse_runtime._run_pactl", return_value=payload):
+            streams = list_active_playback_streams()
+
+        self.assertEqual(len(streams), 1)
+        self.assertEqual(streams[0].index, 12)
+        self.assertEqual(streams[0].app_name, "spotify")
 
     def test_resolve_stream_by_index(self) -> None:
         streams = [
@@ -189,15 +216,124 @@ class PulseStreamDiscoveryTests(unittest.TestCase):
         self.assertIn("app=App", text)
         self.assertIn("pid=42", text)
 
+    def test_list_active_record_streams_filters_and_hides_utility(self) -> None:
+        payload = """
+[
+  {
+    "index": 10,
+    "source": 6,
+    "corked": false,
+    "properties": {
+      "application.name": "PulseAudio Volume Control",
+      "media.name": "Peak detect",
+      "application.process.binary": "pavucontrol"
+    }
+  },
+  {
+    "index": 11,
+    "source": 6,
+    "corked": false,
+    "properties": {
+      "application.name": "pcoip-client-context-",
+      "media.name": "pcoip-record-stream",
+      "application.process.binary": "pcoip-client"
+    }
+  }
+]
+"""
+        with mock.patch("gitssh.audio_pulse_runtime._run_pactl", return_value=payload):
+            streams = list_active_record_streams()
+
+        self.assertEqual([stream.index for stream in streams], [11])
+        self.assertEqual(streams[0].media_name, "pcoip-record-stream")
+
+    def test_list_active_record_streams_keeps_utility_when_only_entries(self) -> None:
+        payload = """
+[
+  {
+    "index": 10,
+    "source": 6,
+    "corked": false,
+    "properties": {
+      "application.name": "PulseAudio Volume Control",
+      "media.name": "Peak detect",
+      "application.process.binary": "pavucontrol"
+    }
+  }
+]
+"""
+        with mock.patch("gitssh.audio_pulse_runtime._run_pactl", return_value=payload):
+            streams = list_active_record_streams()
+
+        self.assertEqual([stream.index for stream in streams], [10])
+
+    def test_resolve_write_stream_by_regex(self) -> None:
+        streams = [
+            PulseRecordStream(
+                index=5,
+                app_name="pcoip-client-context-",
+                media_name="pcoip-record-stream",
+                process_binary="pcoip-client",
+                process_id=100,
+                source="4",
+                corked=False,
+            ),
+            PulseRecordStream(
+                index=6,
+                app_name="discord",
+                media_name="Discord Call",
+                process_binary="discord",
+                process_id=200,
+                source="5",
+                corked=False,
+            ),
+        ]
+        with mock.patch("gitssh.audio_pulse_runtime.list_active_record_streams", return_value=streams):
+            selected = resolve_client_write_stream_index(
+                stream_index=None,
+                stream_match="pcoip-record-stream",
+                interactive=False,
+            )
+        self.assertEqual(selected, 5)
+
+    def test_resolve_write_stream_requires_interactive_without_selector(self) -> None:
+        with mock.patch("gitssh.audio_pulse_runtime.list_active_record_streams", return_value=[]):
+            with self.assertRaises(PulseRuntimeError):
+                resolve_client_write_stream_index(
+                    stream_index=None,
+                    stream_match=None,
+                    interactive=False,
+                )
+
+    def test_describe_record_stream_contains_key_fields(self) -> None:
+        stream = PulseRecordStream(
+            index=9,
+            app_name="App",
+            media_name="Record",
+            process_binary="bin",
+            process_id=42,
+            source="3",
+            corked=False,
+        )
+        text = describe_record_stream(stream)
+        self.assertIn("idx=9", text)
+        self.assertIn("app=App", text)
+        self.assertIn("pid=42", text)
+
+    def test_move_source_output_to_source_invokes_pactl(self) -> None:
+        with mock.patch("gitssh.audio_pulse_runtime._run_pactl") as run_pactl:
+            move_source_output_to_source(source_output_index=834, source_name="sshg_client_virtual_mic_source")
+        run_pactl.assert_called_once_with(
+            ["move-source-output", "834", "sshg_client_virtual_mic_source"]
+        )
+
 
 class ClientVirtualMicManagerTests(unittest.TestCase):
     def test_ensure_ready_creates_modules_and_restores_on_close(self) -> None:
         manager = ClientVirtualMicManager()
         with (
-            mock.patch("gitssh.audio_pulse_runtime._default_device", return_value="old.source"),
             mock.patch("gitssh.audio_pulse_runtime._list_short_names", side_effect=[[], []]),
             mock.patch("gitssh.audio_pulse_runtime._load_module", side_effect=[101, 202]) as load_module,
-            mock.patch("gitssh.audio_pulse_runtime._run_pactl") as run_pactl,
             mock.patch("gitssh.audio_pulse_runtime._unload_module") as unload_module,
         ):
             route = manager.ensure_ready()
@@ -206,20 +342,16 @@ class ClientVirtualMicManagerTests(unittest.TestCase):
             manager.close()
 
         self.assertEqual(load_module.call_count, 2)
-        run_pactl.assert_any_call(["set-default-source", CLIENT_VIRTUAL_MIC_SOURCE])
-        run_pactl.assert_any_call(["set-default-source", "old.source"])
         unload_module.assert_has_calls([mock.call(202), mock.call(101)])
 
     def test_ensure_ready_reuses_existing_devices(self) -> None:
         manager = ClientVirtualMicManager()
         with (
-            mock.patch("gitssh.audio_pulse_runtime._default_device", return_value="old.source"),
             mock.patch(
                 "gitssh.audio_pulse_runtime._list_short_names",
                 side_effect=[[CLIENT_VIRTUAL_MIC_SINK], [CLIENT_VIRTUAL_MIC_SOURCE]],
             ),
             mock.patch("gitssh.audio_pulse_runtime._load_module") as load_module,
-            mock.patch("gitssh.audio_pulse_runtime._run_pactl") as run_pactl,
             mock.patch("gitssh.audio_pulse_runtime._unload_module") as unload_module,
         ):
             manager.ensure_ready()
@@ -227,8 +359,6 @@ class ClientVirtualMicManagerTests(unittest.TestCase):
 
         load_module.assert_not_called()
         unload_module.assert_not_called()
-        run_pactl.assert_any_call(["set-default-source", CLIENT_VIRTUAL_MIC_SOURCE])
-        run_pactl.assert_any_call(["set-default-source", "old.source"])
 
     def test_resolve_server_default_paths_reads_source_and_sink(self) -> None:
         with mock.patch("gitssh.audio_pulse_runtime._default_device", side_effect=["source.default", "sink.default"]):
@@ -236,7 +366,27 @@ class ClientVirtualMicManagerTests(unittest.TestCase):
         self.assertEqual(input_device, "source.default")
         self.assertEqual(output_device, "sink.default")
 
+    def test_enable_default_source_fallback_sets_and_restores_default_source(self) -> None:
+        manager = ClientVirtualMicManager()
+        with (
+            mock.patch(
+                "gitssh.audio_pulse_runtime._list_short_names",
+                side_effect=[[CLIENT_VIRTUAL_MIC_SINK], [CLIENT_VIRTUAL_MIC_SOURCE]],
+            ),
+            mock.patch("gitssh.audio_pulse_runtime._default_device", return_value="old.source"),
+            mock.patch("gitssh.audio_pulse_runtime._run_pactl") as run_pactl,
+        ):
+            manager.ensure_ready()
+            manager.enable_default_source_fallback()
+            manager.close()
+
+        run_pactl.assert_has_calls(
+            [
+                mock.call(["set-default-source", CLIENT_VIRTUAL_MIC_SOURCE]),
+                mock.call(["set-default-source", "old.source"]),
+            ]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
-

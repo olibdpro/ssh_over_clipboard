@@ -10,6 +10,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from gitssh.audio_pipewire_runtime import PipeWireRuntimeError
 from gitssh.client import _build_backend as build_client_backend
 from gitssh.client import _build_parser as build_client_parser
 from gitssh.server import _build_backend as build_server_backend
@@ -23,9 +24,11 @@ class GitClientCliTests(unittest.TestCase):
         self.assertEqual(args.transport, "git")
         self.assertEqual(args.serial_port, "/dev/ttyACM0")
         self.assertEqual(args.serial_baud, 3000000)
-        self.assertIsNone(args.audio_stream_index)
-        self.assertIsNone(args.audio_stream_match)
-        self.assertEqual(args.audio_backend, "pulse-cli")
+        self.assertIsNone(args.pw_capture_node_id)
+        self.assertIsNone(args.pw_capture_match)
+        self.assertIsNone(args.pw_write_node_id)
+        self.assertIsNone(args.pw_write_match)
+        self.assertFalse(args.skip_pw_preflight)
         self.assertEqual(args.audio_modulation, "auto")
 
     def test_supports_usb_serial_transport_options(self) -> None:
@@ -53,69 +56,139 @@ class GitClientCliTests(unittest.TestCase):
                 "localhost",
                 "--transport",
                 "audio-modem",
-                "--audio-stream-index",
+                "--pw-capture-node-id",
                 "77",
-                "--audio-stream-match",
+                "--pw-capture-match",
                 "chrome|firefox",
+                "--pw-write-node-id",
+                "88",
+                "--pw-write-match",
+                "pcoip-record-stream",
                 "--audio-sample-rate",
                 "44100",
                 "--audio-byte-repeat",
                 "5",
                 "--audio-modulation",
                 "robust-v1",
-                "--audio-backend",
-                "pulse-cli",
             ]
         )
         self.assertEqual(args.transport, "audio-modem")
-        self.assertEqual(args.audio_stream_index, 77)
-        self.assertEqual(args.audio_stream_match, "chrome|firefox")
+        self.assertEqual(args.pw_capture_node_id, 77)
+        self.assertEqual(args.pw_capture_match, "chrome|firefox")
+        self.assertEqual(args.pw_write_node_id, 88)
+        self.assertEqual(args.pw_write_match, "pcoip-record-stream")
         self.assertEqual(args.audio_sample_rate, 44100)
         self.assertEqual(args.audio_byte_repeat, 5)
         self.assertEqual(args.audio_modulation, "robust-v1")
-        self.assertEqual(args.audio_backend, "pulse-cli")
 
-    def test_audio_modem_rejects_non_pulse_backend(self) -> None:
+    def test_audio_modem_rejects_legacy_backend_flag(self) -> None:
+        with self.assertRaises(SystemExit):
+            build_client_parser().parse_args(
+                [
+                    "localhost",
+                    "--transport",
+                    "audio-modem",
+                    "--audio-backend",
+                    "pulse-cli",
+                ]
+            )
+
+    def test_audio_modem_rejects_legacy_stream_flags(self) -> None:
+        with self.assertRaises(SystemExit):
+            build_client_parser().parse_args(
+                [
+                    "localhost",
+                    "--transport",
+                    "audio-modem",
+                    "--audio-stream-index",
+                    "11",
+                ]
+            )
+
+    def test_audio_modem_backend_build_with_explicit_node_ids(self) -> None:
         args = build_client_parser().parse_args(
             [
                 "localhost",
                 "--transport",
                 "audio-modem",
-                "--audio-backend",
-                "alsa",
-            ]
-        )
-        with self.assertRaises(TransportError):
-            build_client_backend(args)
-
-    def test_audio_modem_backend_build_with_explicit_stream_index(self) -> None:
-        args = build_client_parser().parse_args(
-            [
-                "localhost",
-                "--transport",
-                "audio-modem",
-                "--audio-stream-index",
+                "--pw-capture-node-id",
                 "11",
+                "--pw-write-node-id",
+                "22",
             ]
-        )
-        fake_manager = mock.MagicMock()
-        fake_manager.ensure_ready.return_value = mock.Mock(
-            sink_name="sshg_client_virtual_mic_sink",
-            source_name="sshg_client_virtual_mic_source",
         )
 
         with (
-            mock.patch("gitssh.client.resolve_client_capture_stream_index", return_value=11),
-            mock.patch("gitssh.client.ClientVirtualMicManager", return_value=fake_manager),
+            mock.patch("gitssh.client.ensure_client_pipewire_preflight") as preflight,
+            mock.patch("gitssh.client.resolve_client_capture_node_id", return_value=11) as resolve_capture,
+            mock.patch("gitssh.client.resolve_client_write_node_id", return_value=22) as resolve_write,
         ):
             backend = build_client_backend(args)
 
         self.assertEqual(
             backend.name(),
-            "audio-modem:pulse-cli:robust-v1:in=@DEFAULT_MONITOR@,out=sshg_client_virtual_mic_sink",
+            "audio-modem:pipewire-link:robust-v1:in=pw-node:11,out=pw-node:22",
         )
+        preflight.assert_called_once_with(capture_node_id=11, write_node_id=22)
+        resolve_capture.assert_called_once()
+        resolve_write.assert_called_once()
         backend.close()
-        fake_manager.close.assert_called_once()
+
+    def test_audio_modem_propagates_pipewire_selection_errors(self) -> None:
+        args = build_client_parser().parse_args(
+            [
+                "localhost",
+                "--transport",
+                "audio-modem",
+            ]
+        )
+        with mock.patch(
+            "gitssh.client.ensure_client_pipewire_preflight",
+            return_value=None,
+        ):
+            with mock.patch(
+                "gitssh.client.resolve_client_capture_node_id",
+                side_effect=PipeWireRuntimeError("selection failed"),
+            ):
+                with self.assertRaises(TransportError):
+                    build_client_backend(args)
+
+    def test_audio_modem_propagates_pipewire_preflight_errors(self) -> None:
+        args = build_client_parser().parse_args(
+            [
+                "localhost",
+                "--transport",
+                "audio-modem",
+            ]
+        )
+        with mock.patch(
+            "gitssh.client.ensure_client_pipewire_preflight",
+            side_effect=PipeWireRuntimeError("preflight failed"),
+        ):
+            with self.assertRaises(TransportError):
+                build_client_backend(args)
+
+    def test_audio_modem_can_skip_pipewire_preflight(self) -> None:
+        args = build_client_parser().parse_args(
+            [
+                "localhost",
+                "--transport",
+                "audio-modem",
+                "--pw-capture-node-id",
+                "11",
+                "--pw-write-node-id",
+                "22",
+                "--skip-pw-preflight",
+            ]
+        )
+        with (
+            mock.patch("gitssh.client.ensure_client_pipewire_preflight") as preflight,
+            mock.patch("gitssh.client.resolve_client_capture_node_id", return_value=11),
+            mock.patch("gitssh.client.resolve_client_write_node_id", return_value=22),
+        ):
+            backend = build_client_backend(args)
+        preflight.assert_not_called()
+        backend.close()
 
     def test_supports_google_drive_transport_options(self) -> None:
         args = build_client_parser().parse_args(
@@ -160,7 +233,6 @@ class GitServerCliTests(unittest.TestCase):
         self.assertEqual(args.transport, "git")
         self.assertEqual(args.serial_port, "/dev/ttyACM0")
         self.assertEqual(args.serial_baud, 3000000)
-        self.assertEqual(args.audio_backend, "pulse-cli")
         self.assertEqual(args.audio_modulation, "auto")
 
     def test_supports_usb_serial_transport_options(self) -> None:
@@ -190,26 +262,22 @@ class GitServerCliTests(unittest.TestCase):
                 "24",
                 "--audio-modulation",
                 "legacy",
-                "--audio-backend",
-                "pulse-cli",
             ]
         )
         self.assertEqual(args.transport, "audio-modem")
         self.assertEqual(args.audio_marker_run, 24)
         self.assertEqual(args.audio_modulation, "legacy")
-        self.assertEqual(args.audio_backend, "pulse-cli")
 
-    def test_audio_modem_rejects_non_pulse_backend(self) -> None:
-        args = build_server_parser().parse_args(
-            [
-                "--transport",
-                "audio-modem",
-                "--audio-backend",
-                "alsa",
-            ]
-        )
-        with self.assertRaises(TransportError):
-            build_server_backend(args)
+    def test_server_rejects_legacy_audio_backend_flag(self) -> None:
+        with self.assertRaises(SystemExit):
+            build_server_parser().parse_args(
+                [
+                    "--transport",
+                    "audio-modem",
+                    "--audio-backend",
+                    "pulse-cli",
+                ]
+            )
 
     def test_audio_modem_backend_uses_server_defaults(self) -> None:
         args = build_server_parser().parse_args(
