@@ -97,7 +97,6 @@ class GitSSHClient:
         self._sync_stop = threading.Event()
         self._sync_thread = threading.Thread(
             target=self._sync_loop,
-            daemon=True,
             name="gitssh-client-sync",
         )
         self._sync_thread.start()
@@ -111,7 +110,7 @@ class GitSSHClient:
         if stop_event is not None:
             stop_event.set()
         if thread is not None:
-            thread.join(timeout=1.0)
+            thread.join()
 
     def _sync_loop(self) -> None:
         stop_event = self._sync_stop
@@ -211,6 +210,8 @@ class GitSSHClient:
 
             deadline = time.monotonic() + self.config.connect_timeout
             next_send = 0.0
+            diag_pings_received = 0
+            last_diag_phase: str | None = None
 
             while time.monotonic() < deadline:
                 now = time.monotonic()
@@ -227,6 +228,18 @@ class GitSSHClient:
                         continue
 
                     if not state.incoming_seen.mark(incoming.msg_id):
+                        continue
+
+                    if incoming.kind == "diag_ping":
+                        body = incoming.body if isinstance(incoming.body, dict) else {}
+                        phase = body.get("phase")
+                        if isinstance(phase, str) and phase:
+                            last_diag_phase = phase
+                        diag_pings_received += 1
+                        self._log(
+                            "received diag_ping during connect "
+                            f"(count={diag_pings_received}, phase={last_diag_phase or 'unknown'}, seq={incoming.seq})"
+                        )
                         continue
 
                     if incoming.kind == "connect_ack":
@@ -253,7 +266,14 @@ class GitSSHClient:
 
                 time.sleep(self.config.poll_interval)
 
-            raise TimeoutError("Timed out waiting for server connect_ack")
+            if diag_pings_received > 0:
+                suffix = (
+                    f" (diag_pings_received={diag_pings_received}, "
+                    f"last_diag_phase={last_diag_phase or 'unknown'})"
+                )
+            else:
+                suffix = ""
+            raise TimeoutError(f"Timed out waiting for server connect_ack{suffix}")
         except Exception:
             self._state = None
             self._stream_id = None
@@ -363,6 +383,18 @@ class GitSSHClient:
         if incoming.kind == "error":
             message = body.get("error", "unknown server error")
             raise RuntimeError(str(message))
+
+        if incoming.kind == "diag_ping":
+            phase = body.get("phase")
+            counter = body.get("diag_counter")
+            if isinstance(phase, str):
+                if isinstance(counter, int):
+                    self._log(f"diag_ping phase={phase} counter={counter}")
+                else:
+                    self._log(f"diag_ping phase={phase}")
+            else:
+                self._log("diag_ping received")
+            return None
 
         return None
 
@@ -622,7 +654,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--audio-write-timeout-ms",
         type=int,
-        default=50,
+        default=500,
         help="Audio write timeout in milliseconds for --transport audio-modem",
     )
     parser.add_argument(

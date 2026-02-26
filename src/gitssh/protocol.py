@@ -16,6 +16,7 @@ WIRE_PREFIX = ""
 VALID_KINDS = {
     "connect_req",
     "connect_ack",
+    "diag_ping",
     "pty_input",
     "pty_output",
     "pty_resize",

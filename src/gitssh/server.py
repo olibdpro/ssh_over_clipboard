@@ -46,6 +46,9 @@ class ServerConfig:
     io_flush_interval: float = 0.02
     fetch_interval: float = 0.1
     push_interval: float = 0.1
+    diag: bool = False
+    diag_interval: float = 1.0
+    diag_connect_burst: int = 3
     verbose: bool = False
 
 
@@ -67,6 +70,8 @@ class GitSSHServer:
         self._cursor: str | None = None
         self._sync_stop: threading.Event | None = None
         self._sync_thread: threading.Thread | None = None
+        self._diag_counter = 0
+        self._next_diag_at = 0.0
 
     def _log(self, text: str) -> None:
         if self.config.verbose:
@@ -83,7 +88,6 @@ class GitSSHServer:
         self._sync_stop = threading.Event()
         self._sync_thread = threading.Thread(
             target=self._sync_loop,
-            daemon=True,
             name="gitssh-server-sync",
         )
         self._sync_thread.start()
@@ -97,7 +101,7 @@ class GitSSHServer:
         if stop_event is not None:
             stop_event.set()
         if thread is not None:
-            thread.join(timeout=1.0)
+            thread.join()
 
     def _sync_loop(self) -> None:
         stop_event = self._sync_stop
@@ -180,6 +184,70 @@ class GitSSHServer:
         self._log(f"closing session {self._active.state.session_id}")
         self._active.shell.close()
         self._active = None
+        self._next_diag_at = 0.0
+
+    def _emit_diag_ping(self, *, session_id: str, phase: str, body: dict[str, Any] | None = None) -> None:
+        if not self.config.diag:
+            return
+        payload: dict[str, Any] = {
+            "phase": phase,
+            "backend": self.backend.name(),
+            "server_monotonic_ns": time.monotonic_ns(),
+            "active_session": self._active is not None,
+        }
+        if body:
+            payload.update(body)
+        self._write_message(
+            self._make_message(
+                kind="diag_ping",
+                session_id=session_id,
+                body=payload,
+            )
+        )
+        self._log(
+            f"diag_ping phase={phase} session={session_id} counter={payload.get('diag_counter', '?')}"
+        )
+
+    def _emit_diag_connect_burst(
+        self,
+        *,
+        session_id: str,
+        phase: str,
+        body: dict[str, Any] | None = None,
+    ) -> None:
+        if not self.config.diag:
+            return
+        count = max(self.config.diag_connect_burst, 1)
+        for idx in range(count):
+            payload = dict(body or {})
+            payload["burst_index"] = idx + 1
+            payload["burst_total"] = count
+            self._diag_counter += 1
+            payload["diag_counter"] = self._diag_counter
+            self._emit_diag_ping(session_id=session_id, phase=phase, body=payload)
+
+    def _maybe_emit_diag_ping(self) -> None:
+        if not self.config.diag:
+            return
+        session = self._active
+        if session is None:
+            return
+
+        now = time.monotonic()
+        interval = max(self.config.diag_interval, 0.05)
+        if now < self._next_diag_at:
+            return
+
+        self._diag_counter += 1
+        self._emit_diag_ping(
+            session_id=session.state.session_id,
+            phase="active_heartbeat",
+            body={
+                "diag_counter": self._diag_counter,
+                "stream_id": session.stream_id,
+            },
+        )
+        self._next_diag_at = now + interval
 
     def _term_size_from_connect(self, message: Message) -> tuple[int, int]:
         cols = 80
@@ -215,9 +283,20 @@ class GitSSHServer:
         }
 
     def _handle_connect(self, message: Message) -> None:
+        self._emit_diag_connect_burst(
+            session_id=message.session_id,
+            phase="connect_req_received",
+            body={"has_active_session": self._active is not None},
+        )
+
         if self._active is not None:
             if message.session_id == self._active.state.session_id:
                 self._log(f"re-acknowledging session {message.session_id}")
+                self._emit_diag_connect_burst(
+                    session_id=message.session_id,
+                    phase="connect_req_reack",
+                    body={"stream_id": self._active.stream_id},
+                )
                 self._write_message(
                     self._make_message(
                         kind="connect_ack",
@@ -231,6 +310,11 @@ class GitSSHServer:
                 return
 
             self._log(f"rejecting session {message.session_id}: busy")
+            self._emit_diag_connect_burst(
+                session_id=message.session_id,
+                phase="connect_req_busy",
+                body={"active_session_id": self._active.state.session_id},
+            )
             self._write_message(
                 self._make_message(
                     kind="busy",
@@ -261,6 +345,12 @@ class GitSSHServer:
 
         self._log(
             f"accepted session {message.session_id} using {shell_path} (stream_id={stream_id})"
+        )
+        self._next_diag_at = time.monotonic()
+        self._emit_diag_connect_burst(
+            session_id=message.session_id,
+            phase="connect_ack_enqueued",
+            body={"stream_id": stream_id, "shell": shell_path},
         )
         self._write_message(
             self._make_message(
@@ -498,6 +588,7 @@ class GitSSHServer:
 
                 self._drain_pty_output()
                 self._check_for_shell_exit()
+                self._maybe_emit_diag_ping()
 
                 time.sleep(self.config.poll_interval)
         finally:
@@ -621,7 +712,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--audio-write-timeout-ms",
         type=int,
-        default=50,
+        default=500,
         help="Audio write timeout in milliseconds for --transport audio-modem",
     )
     parser.add_argument(
@@ -700,6 +791,24 @@ def _build_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.1,
         help="Seconds between background push operations",
+    )
+    parser.add_argument(
+        "-diag",
+        "--diag",
+        action="store_true",
+        help="Emit diagnostic ping frames (diag_ping) to clients for audio path troubleshooting",
+    )
+    parser.add_argument(
+        "--diag-interval-ms",
+        type=int,
+        default=1000,
+        help="Milliseconds between periodic diagnostic pings while a session is active",
+    )
+    parser.add_argument(
+        "--diag-connect-burst",
+        type=int,
+        default=3,
+        help="Number of diagnostic pings to emit for each connect_req handling phase",
     )
     return parser
 
@@ -798,6 +907,9 @@ def main(argv: list[str] | None = None) -> int:
         io_flush_interval=max(args.io_flush_interval, 0.0),
         fetch_interval=max(args.fetch_interval, 0.02),
         push_interval=max(args.push_interval, 0.02),
+        diag=args.diag,
+        diag_interval=max(args.diag_interval_ms / 1000.0, 0.0),
+        diag_connect_burst=max(args.diag_connect_burst, 1),
         verbose=args.verbose,
     )
 

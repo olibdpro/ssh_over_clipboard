@@ -229,6 +229,14 @@ class AudioModemTransportBackend:
             try:
                 io_obj.write(pcm)
             except AudioIOError as exc:
+                if item.seq is None:
+                    # Keep ACK frames queued so a transient sink stall does not lose them.
+                    self._tx_queue.appendleft(item)
+                else:
+                    pending = self._pending.get(item.seq)
+                    if pending is not None:
+                        # Allow retransmission after transient write failures.
+                        pending.queued = False
                 raise AudioModemTransportError(f"Audio write failed: {exc}") from exc
             if item.seq is not None:
                 pending = self._pending.get(item.seq)

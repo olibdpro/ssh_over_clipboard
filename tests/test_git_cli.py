@@ -234,6 +234,9 @@ class GitServerCliTests(unittest.TestCase):
         self.assertEqual(args.serial_port, "/dev/ttyACM0")
         self.assertEqual(args.serial_baud, 3000000)
         self.assertEqual(args.audio_modulation, "auto")
+        self.assertFalse(args.diag)
+        self.assertEqual(args.diag_interval_ms, 1000)
+        self.assertEqual(args.diag_connect_burst, 3)
 
     def test_supports_usb_serial_transport_options(self) -> None:
         args = build_server_parser().parse_args(
@@ -267,6 +270,20 @@ class GitServerCliTests(unittest.TestCase):
         self.assertEqual(args.transport, "audio-modem")
         self.assertEqual(args.audio_marker_run, 24)
         self.assertEqual(args.audio_modulation, "legacy")
+
+    def test_supports_diag_options(self) -> None:
+        args = build_server_parser().parse_args(
+            [
+                "-diag",
+                "--diag-interval-ms",
+                "250",
+                "--diag-connect-burst",
+                "7",
+            ]
+        )
+        self.assertTrue(args.diag)
+        self.assertEqual(args.diag_interval_ms, 250)
+        self.assertEqual(args.diag_connect_burst, 7)
 
     def test_server_rejects_legacy_audio_backend_flag(self) -> None:
         with self.assertRaises(SystemExit):

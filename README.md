@@ -197,6 +197,16 @@ sshgd -v \
   --transport audio-modem
 ```
 
+Diagnostic ping mode (server emits `diag_ping` frames for handshake/audio-path debugging):
+
+```bash
+sshgd -v \
+  --transport audio-modem \
+  -diag \
+  --diag-interval-ms 500 \
+  --diag-connect-burst 5
+```
+
 Run client on host (interactive PipeWire node prompts):
 
 ```bash

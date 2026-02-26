@@ -50,6 +50,7 @@ class GitProtocolTests(unittest.TestCase):
     def test_expected_kinds_available(self) -> None:
         self.assertIn("connect_req", VALID_KINDS)
         self.assertIn("connect_ack", VALID_KINDS)
+        self.assertIn("diag_ping", VALID_KINDS)
         self.assertIn("pty_input", VALID_KINDS)
         self.assertIn("pty_output", VALID_KINDS)
         self.assertIn("pty_resize", VALID_KINDS)

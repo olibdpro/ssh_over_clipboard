@@ -13,6 +13,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from gitssh.audio_io_ffmpeg import AudioDuplexIO
+from gitssh.audio_io_ffmpeg import AudioIOError
 from gitssh.audio_modem_transport import (
     AudioModemTransportBackend,
     AudioModemTransportConfig,
@@ -55,6 +56,18 @@ class _LoopAudioEndpoint(AudioDuplexIO):
         with self._lock:
             self._closed = True
             self._buffer.clear()
+
+
+class _FailOnceWriteEndpoint(_LoopAudioEndpoint):
+    def __init__(self) -> None:
+        super().__init__()
+        self._fail_next_write = True
+
+    def write(self, data: bytes) -> None:
+        if self._fail_next_write:
+            self._fail_next_write = False
+            raise AudioIOError("transient write failure")
+        super().write(data)
 
 
 def _pair_endpoints() -> tuple[_LoopAudioEndpoint, _LoopAudioEndpoint]:
@@ -182,6 +195,69 @@ class AudioModemTransportTests(unittest.TestCase):
                 body={"host": "localhost"},
             )
             backend_a.write_outbound_message(message)
+
+            received = []
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not received:
+                backend_a.push_outbound()
+                backend_b.fetch_inbound()
+                backend_b.push_outbound()
+                backend_a.fetch_inbound()
+                messages, cursor = backend_b.read_inbound_messages(cursor)
+                if messages:
+                    received.extend(messages)
+                time.sleep(0.005)
+
+            self.assertEqual(len(received), 1)
+            self.assertEqual(received[0].msg_id, message.msg_id)
+        finally:
+            backend_a.close()
+            backend_b.close()
+
+    def test_transient_write_failure_does_not_stall_retransmit_queue(self) -> None:
+        endpoint_a = _FailOnceWriteEndpoint()
+        endpoint_b = _LoopAudioEndpoint()
+        endpoint_a.connect(endpoint_b)
+        endpoint_b.connect(endpoint_a)
+
+        backend_a = AudioModemTransportBackend(
+            AudioModemTransportConfig(
+                input_device="test",
+                output_device="test",
+                ack_timeout=0.02,
+                max_retries=10,
+                byte_repeat=3,
+                marker_run=8,
+                audio_modulation="legacy",
+                io_factory=lambda _cfg: endpoint_a,
+            )
+        )
+        backend_b = AudioModemTransportBackend(
+            AudioModemTransportConfig(
+                input_device="test",
+                output_device="test",
+                ack_timeout=0.02,
+                max_retries=10,
+                byte_repeat=3,
+                marker_run=8,
+                audio_modulation="legacy",
+                io_factory=lambda _cfg: endpoint_b,
+            )
+        )
+        try:
+            cursor = backend_b.snapshot_inbound_cursor()
+            message = build_message(
+                kind="connect_req",
+                session_id=str(uuid.uuid4()),
+                source="client",
+                target="server",
+                seq=1,
+                body={"host": "localhost"},
+            )
+            backend_a.write_outbound_message(message)
+
+            with self.assertRaises(AudioModemTransportError):
+                backend_a.push_outbound()
 
             received = []
             deadline = time.monotonic() + 2.0

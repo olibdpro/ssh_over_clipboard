@@ -445,20 +445,80 @@ def _parse_pw_link_ports(output: str) -> list[str]:
     return ports
 
 
+def _normalize_pipewire_aliases(value: str) -> list[str]:
+    stripped = (value or "").strip()
+    if not stripped:
+        return []
+
+    collapsed = re.sub(r"\s+", " ", stripped)
+    variants = [
+        stripped,
+        collapsed,
+        collapsed.replace(" ", "-"),
+        collapsed.replace(" ", "_"),
+        collapsed.replace(" ", ""),
+    ]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in variants:
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        deduped.append(item)
+    return deduped
+
+
+def _build_port_prefixes(
+    *,
+    node_name: str,
+    node_id: int | None,
+    alias_candidates: list[str] | None = None,
+) -> list[str]:
+    prefixes: list[str] = []
+    for alias in _normalize_pipewire_aliases(node_name):
+        prefixes.append(f"{alias}:")
+    if alias_candidates:
+        for alias in alias_candidates:
+            for normalized in _normalize_pipewire_aliases(alias):
+                prefixes.append(f"{normalized}:")
+    if node_id is not None:
+        prefixes.append(f"{node_id}:")
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for prefix in prefixes:
+        if prefix in seen:
+            continue
+        seen.add(prefix)
+        deduped.append(prefix)
+    return deduped
+
+
+def _node_alias_candidates(node: PipeWireNode) -> list[str]:
+    aliases: list[str] = []
+    if node.node_name:
+        aliases.append(node.node_name)
+    if node.node_description:
+        aliases.append(node.node_description)
+    if node.app_name:
+        aliases.append(node.app_name)
+    return aliases
+
+
 def _ports_for_node(
     *,
     node_name: str,
     node_id: int | None,
     direction: str,
+    alias_candidates: list[str] | None = None,
 ) -> tuple[list[str], str]:
     args = ["-o"] if direction == "output" else ["-i"]
     listing = _run_pw_link(args)
-    prefixes: list[str] = []
-    stripped_name = (node_name or "").strip()
-    if stripped_name:
-        prefixes.append(f"{stripped_name}:")
-    if node_id is not None:
-        prefixes.append(f"{node_id}:")
+    prefixes = _build_port_prefixes(
+        node_name=node_name,
+        node_id=node_id,
+        alias_candidates=alias_candidates,
+    )
 
     ports = _parse_pw_link_ports(listing)
     matches = [port for port in ports if any(port.startswith(prefix) for prefix in prefixes)]
@@ -594,6 +654,13 @@ class PipeWireLinkAudioDuplexIO:
         unique = f"{os.getpid()}_{int(time.monotonic() * 1000)}"
         self._capture_node_name = f"sshg_capture_{unique}"
         self._playback_node_name = f"sshg_playback_{unique}"
+        self._capture_link_target_name = self._capture_node_name
+        self._capture_link_target_id: int | None = None
+        self._capture_link_target_aliases: list[str] = ["pw-record"]
+        self._playback_link_source_name = self._playback_node_name
+        self._playback_link_source_id: int | None = None
+        self._playback_link_source_aliases: list[str] = ["pw-play"]
+        self._known_node_ids = self._snapshot_node_ids()
         self._capture_file_path = f"/tmp/{self._capture_node_name}.raw"
         self._playback_fifo_path = f"/tmp/{self._playback_node_name}.raw.fifo"
 
@@ -625,8 +692,8 @@ class PipeWireLinkAudioDuplexIO:
         except Exception:
             self.close()
             raise
-        capture_target = "0" if self._routing_mode == "explicit_link" else str(self._capture_target_id)
-        playback_target = "0" if self._routing_mode == "explicit_link" else str(self._playback_target_id)
+        capture_target = str(self._capture_target_id)
+        playback_target = str(self._playback_target_id)
 
         capture_cmd = [
             pw_record_bin,
@@ -691,7 +758,19 @@ class PipeWireLinkAudioDuplexIO:
 
             self._wait_for_process_stability()
             if self._routing_mode == "explicit_link":
-                self._ensure_links_ready()
+                self._refresh_dynamic_link_nodes()
+                try:
+                    self._ensure_links_ready()
+                except PipeWireRuntimeError as exc:
+                    detail = str(exc).splitlines()[0] if str(exc).strip() else str(exc)
+                    self._routing_mode = "direct_target_fallback"
+                    self._routing_note = f"explicit link setup failed: {detail}"
+                    print(
+                        "[sshg] warning: PipeWire explicit link setup failed; continuing with direct "
+                        f"targets (capture target={self._capture_target_id}, "
+                        f"write target={self._playback_target_id}): {detail}",
+                        file=sys.stderr,
+                    )
         except Exception:
             self.close()
             raise
@@ -699,8 +778,14 @@ class PipeWireLinkAudioDuplexIO:
     def _choose_routing_mode(self) -> None:
         self._capture_target_id = self._capture_source_id
         self._playback_target_id = self._write_target_id
-        output_prefixes = [f"{self._capture_source_name}:", f"{self._capture_source_id}:"]
-        input_prefixes = [f"{self._write_target_name}:", f"{self._write_target_id}:"]
+        output_prefixes = _build_port_prefixes(
+            node_name=self._capture_source_name,
+            node_id=self._capture_source_id,
+        )
+        input_prefixes = _build_port_prefixes(
+            node_name=self._write_target_name,
+            node_id=self._write_target_id,
+        )
         try:
             capture_ports, capture_listing = _ports_for_node(
                 node_name=self._capture_source_name,
@@ -752,6 +837,89 @@ class PipeWireLinkAudioDuplexIO:
             f"capture sample={capture_sample!r} write sample={write_sample!r}",
             file=sys.stderr,
         )
+
+    def _retarget_capture_stream_for_direct_fallback(self) -> list[str]:
+        capture_media = self._capture_source_media_class.lower()
+        if "stream/output/audio" not in capture_media:
+            return []
+
+        sink_id = self._first_sink_node_id()
+        if sink_id is None:
+            return []
+
+        self._capture_target_id = sink_id
+        return [
+            f"capture stream node {self._capture_source_id} uses fallback sink node {sink_id} for direct capture"
+        ]
+
+    def _snapshot_node_ids(self) -> set[int]:
+        try:
+            return {node.node_id for node in list_nodes()}
+        except PipeWireRuntimeError:
+            return set()
+
+    def _select_stream_link_node(
+        self,
+        *,
+        nodes: list[PipeWireNode],
+        new_nodes: list[PipeWireNode],
+        preferred_name: str,
+        expected_media_class: str,
+    ) -> PipeWireNode | None:
+        if preferred_name:
+            for node in nodes:
+                if node.node_name == preferred_name:
+                    return node
+
+        lowered_expected = expected_media_class.lower()
+        media_matches = [
+            node
+            for node in new_nodes
+            if lowered_expected in (node.media_class or "").strip().lower()
+        ]
+        if len(media_matches) == 1:
+            return media_matches[0]
+
+        prefixed = [node for node in media_matches if (node.node_name or "").startswith("sshg_")]
+        if prefixed:
+            return max(prefixed, key=lambda node: node.node_id)
+        if media_matches:
+            return max(media_matches, key=lambda node: node.node_id)
+        return None
+
+    def _refresh_dynamic_link_nodes(self) -> None:
+        try:
+            nodes = list_nodes()
+        except PipeWireRuntimeError:
+            return
+
+        new_nodes = [node for node in nodes if node.node_id not in self._known_node_ids]
+
+        capture_target = self._select_stream_link_node(
+            nodes=nodes,
+            new_nodes=new_nodes,
+            preferred_name=self._capture_node_name,
+            expected_media_class="stream/input/audio",
+        )
+        if capture_target is not None:
+            if capture_target.node_name:
+                self._capture_link_target_name = capture_target.node_name
+            self._capture_link_target_id = capture_target.node_id
+            self._capture_link_target_aliases = _node_alias_candidates(capture_target)
+
+        playback_source = self._select_stream_link_node(
+            nodes=nodes,
+            new_nodes=new_nodes,
+            preferred_name=self._playback_node_name,
+            expected_media_class="stream/output/audio",
+        )
+        if playback_source is not None:
+            if playback_source.node_name:
+                self._playback_link_source_name = playback_source.node_name
+            self._playback_link_source_id = playback_source.node_id
+            self._playback_link_source_aliases = _node_alias_candidates(playback_source)
+
+        self._known_node_ids = {node.node_id for node in nodes}
 
     def _retarget_stream_nodes_for_direct_fallback(self) -> list[str]:
         reasons: list[str] = []
@@ -887,13 +1055,15 @@ class PipeWireLinkAudioDuplexIO:
         self._link_direction(
             output_node_name=self._capture_source_name,
             output_node_id=self._capture_source_id,
-            input_node_name=self._capture_node_name,
-            input_node_id=None,
+            input_node_name=self._capture_link_target_name,
+            input_node_id=self._capture_link_target_id,
+            input_aliases=self._capture_link_target_aliases,
             label="capture",
         )
         self._link_direction(
-            output_node_name=self._playback_node_name,
-            output_node_id=None,
+            output_node_name=self._playback_link_source_name,
+            output_node_id=self._playback_link_source_id,
+            output_aliases=self._playback_link_source_aliases,
             input_node_name=self._write_target_name,
             input_node_id=self._write_target_id,
             label="write",
@@ -907,6 +1077,8 @@ class PipeWireLinkAudioDuplexIO:
         input_node_name: str,
         input_node_id: int | None,
         label: str,
+        output_aliases: list[str] | None = None,
+        input_aliases: list[str] | None = None,
     ) -> None:
         deadline = time.monotonic() + 3.0
         output_ports: list[str] = []
@@ -919,20 +1091,24 @@ class PipeWireLinkAudioDuplexIO:
                 node_name=output_node_name,
                 node_id=output_node_id,
                 direction="output",
+                alias_candidates=output_aliases,
             )
             input_ports, input_listing = _ports_for_node(
                 node_name=input_node_name,
                 node_id=input_node_id,
                 direction="input",
+                alias_candidates=input_aliases,
             )
             if output_ports and input_ports:
                 break
             time.sleep(0.05)
 
         if not output_ports:
-            output_prefixes = [f"{output_node_name}:"]
-            if output_node_id is not None:
-                output_prefixes.append(f"{output_node_id}:")
+            output_prefixes = _build_port_prefixes(
+                node_name=output_node_name,
+                node_id=output_node_id,
+                alias_candidates=output_aliases,
+            )
             output_sample = "\n".join(output_listing.splitlines()[:12]) or "<none>"
             raise PipeWireRuntimeError(
                 f"Failed to find output ports for {label} link source node "
@@ -941,9 +1117,11 @@ class PipeWireLinkAudioDuplexIO:
                 f"Available output ports sample:\n{output_sample}"
             )
         if not input_ports:
-            input_prefixes = [f"{input_node_name}:"]
-            if input_node_id is not None:
-                input_prefixes.append(f"{input_node_id}:")
+            input_prefixes = _build_port_prefixes(
+                node_name=input_node_name,
+                node_id=input_node_id,
+                alias_candidates=input_aliases,
+            )
             input_sample = "\n".join(input_listing.splitlines()[:12]) or "<none>"
             raise PipeWireRuntimeError(
                 f"Failed to find input ports for {label} link target node "
