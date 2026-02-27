@@ -60,6 +60,11 @@ _PORT_HEADER_RE = re.compile(r"^id\s+(\d+),\s+type\s+PipeWire:Interface:Port/\d+
 _NODE_PROP_RE = re.compile(r"^([A-Za-z0-9_.-]+)\s*=\s*\"(.*)\"$")
 
 
+def _is_sink_node(node: PipeWireNode) -> bool:
+    media_class = (node.media_class or "").strip().lower()
+    return media_class.startswith("audio/sink")
+
+
 def _run_command(cmd: list[str], *, friendly_name: str) -> str:
     try:
         result = subprocess.run(
@@ -88,6 +93,36 @@ def _run_pw_cli(args: list[str]) -> str:
 
 def _run_pw_link(args: list[str]) -> str:
     return _run_command(["pw-link", *args], friendly_name=f"pw-link {' '.join(args)}")
+
+
+def _default_sink_name_from_pactl() -> str | None:
+    def _run(args: list[str]) -> tuple[int, str]:
+        try:
+            result = subprocess.run(
+                ["pactl", *args],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception:
+            return 1, ""
+        return result.returncode, (result.stdout or "").strip()
+
+    code, stdout = _run(["get-default-sink"])
+    if code == 0 and stdout:
+        return stdout.splitlines()[-1].strip()
+
+    code, stdout = _run(["info"])
+    if code != 0 or not stdout:
+        return None
+    for raw in stdout.splitlines():
+        line = raw.strip()
+        if not line.startswith("Default Sink:"):
+            continue
+        value = line.split(":", 1)[1].strip()
+        if value:
+            return value
+    return None
 
 
 def _systemctl_user_unit_state(unit_name: str) -> str | None:
@@ -264,7 +299,7 @@ def _is_capture_candidate(node: PipeWireNode) -> bool:
         return False
     if "output/audio" in media_class:
         return True
-    if media_class.startswith("audio/sink"):
+    if _is_sink_node(node):
         return True
     return False
 
@@ -281,7 +316,10 @@ def _is_write_candidate(node: PipeWireNode) -> bool:
 
 
 def list_capture_nodes() -> list[PipeWireNode]:
-    return [node for node in list_nodes() if _is_capture_candidate(node)]
+    # Prefer stable sink-monitor capture candidates ahead of transient stream-output nodes.
+    nodes = [node for node in list_nodes() if _is_capture_candidate(node)]
+    nodes.sort(key=lambda node: (0 if _is_sink_node(node) else 1, -node.node_id))
+    return nodes
 
 
 def list_write_nodes() -> list[PipeWireNode]:
@@ -630,6 +668,8 @@ class PipeWireLinkAudioDuplexIO:
         self._playback_fifo_dummy_rx_fd: int | None = None
         self._capture_file_path: str | None = None
         self._playback_fifo_path: str | None = None
+        self._capture_header_buffer = bytearray()
+        self._capture_header_skipped = False
         self._closed = False
 
         capture_node = _node_for_id(capture_node_id)
@@ -754,15 +794,17 @@ class PipeWireLinkAudioDuplexIO:
             if self._playback.poll() is not None:
                 raise PipeWireRuntimeError(_process_stderr(self._playback, "pw-play playback"))
 
-            self._close_fd("_playback_fifo_dummy_rx_fd")
-
             self._wait_for_process_stability()
+            self._close_fd("_playback_fifo_dummy_rx_fd")
             if self._routing_mode == "explicit_link":
                 self._refresh_dynamic_link_nodes()
                 try:
                     self._ensure_links_ready()
                 except PipeWireRuntimeError as exc:
                     detail = str(exc).splitlines()[0] if str(exc).strip() else str(exc)
+                    # A partial link setup can leave duplicate signal paths when we fall back
+                    # to direct targets, so drop any links we may have created before failure.
+                    self._unlink_linked_pairs(start_index=0)
                     self._routing_mode = "direct_target_fallback"
                     self._routing_note = f"explicit link setup failed: {detail}"
                     print(
@@ -843,7 +885,7 @@ class PipeWireLinkAudioDuplexIO:
         if "stream/output/audio" not in capture_media:
             return []
 
-        sink_id = self._first_sink_node_id()
+        sink_id = self._preferred_sink_node_id()
         if sink_id is None:
             return []
 
@@ -851,6 +893,24 @@ class PipeWireLinkAudioDuplexIO:
         return [
             f"capture stream node {self._capture_source_id} uses fallback sink node {sink_id} for direct capture"
         ]
+
+    def _retarget_capture_stream_to_sink_for_stable_rx(self) -> None:
+        capture_media = self._capture_source_media_class.lower()
+        if "stream/output/audio" not in capture_media:
+            return
+
+        sink_id = self._preferred_sink_node_id()
+        if sink_id is None or sink_id == self._capture_source_id:
+            return
+
+        try:
+            sink_node = _node_for_id(sink_id)
+        except PipeWireRuntimeError:
+            return
+
+        self._capture_source_name = sink_node.node_name
+        self._capture_source_id = sink_node.node_id
+        self._capture_source_media_class = (sink_node.media_class or "").strip()
 
     def _snapshot_node_ids(self) -> set[int]:
         try:
@@ -922,42 +982,29 @@ class PipeWireLinkAudioDuplexIO:
         self._known_node_ids = {node.node_id for node in nodes}
 
     def _retarget_stream_nodes_for_direct_fallback(self) -> list[str]:
-        reasons: list[str] = []
-        sink_id: int | None = None
-        capture_media = self._capture_source_media_class.lower()
-        write_media = self._write_target_media_class.lower()
+        # Keep direct fallback pinned to user-selected targets. Automatic stream->sink
+        # retargeting can silently capture the wrong path on PCoIP clients.
+        return []
 
-        if "stream/output/audio" in capture_media:
-            sink_id = self._first_sink_node_id()
-            if sink_id is not None:
-                self._capture_target_id = sink_id
-                reasons.append(
-                    f"capture stream node {self._capture_source_id} has no exposed ports; "
-                    f"routing capture via sink node {sink_id}"
-                )
-
-        if "stream/input/audio" in write_media:
-            if sink_id is None:
-                sink_id = self._first_sink_node_id()
-            if sink_id is not None:
-                self._playback_target_id = sink_id
-                reasons.append(
-                    f"write stream node {self._write_target_id} has no exposed ports; "
-                    f"routing playback via sink node {sink_id}"
-                )
-
-        return reasons
-
-    def _first_sink_node_id(self) -> int | None:
+    def _preferred_sink_node_id(self) -> int | None:
         try:
             nodes = list_nodes()
         except PipeWireRuntimeError:
             return None
-        for node in nodes:
-            media_class = (node.media_class or "").strip().lower()
-            if media_class.startswith("audio/sink"):
+        sinks = [node for node in nodes if _is_sink_node(node)]
+        if not sinks:
+            return None
+
+        default_name = _default_sink_name_from_pactl()
+        if default_name:
+            for node in sinks:
+                if node.node_name == default_name:
+                    return node.node_id
+
+        for node in sinks:
+            if node.node_name:
                 return node.node_id
-        return None
+        return sinks[0].node_id
 
     def _pipewire_has_visible_ports(self) -> bool:
         try:
@@ -1004,6 +1051,27 @@ class PipeWireLinkAudioDuplexIO:
             raise PipeWireRuntimeError(f"Failed to open capture file for read '{path}': {exc}") from exc
         os.set_blocking(fd, False)
         return fd
+
+    def _normalize_capture_chunk(self, chunk: bytes) -> bytes:
+        if self._capture_header_skipped:
+            return chunk
+        if chunk:
+            self._capture_header_buffer.extend(chunk)
+
+        buffered = self._capture_header_buffer
+        if len(buffered) < 12:
+            return b""
+
+        if len(buffered) >= 44 and buffered[:4] == b"RIFF" and buffered[8:12] == b"WAVE":
+            payload = bytes(buffered[44:])
+            buffered.clear()
+            self._capture_header_skipped = True
+            return payload
+
+        payload = bytes(buffered)
+        buffered.clear()
+        self._capture_header_skipped = True
+        return payload
 
     def _open_fifo_for_read(self, path: str, *, label: str) -> int:
         try:
@@ -1052,22 +1120,40 @@ class PipeWireLinkAudioDuplexIO:
             time.sleep(0.01)
 
     def _ensure_links_ready(self) -> None:
-        self._link_direction(
-            output_node_name=self._capture_source_name,
-            output_node_id=self._capture_source_id,
-            input_node_name=self._capture_link_target_name,
-            input_node_id=self._capture_link_target_id,
-            input_aliases=self._capture_link_target_aliases,
-            label="capture",
-        )
-        self._link_direction(
-            output_node_name=self._playback_link_source_name,
-            output_node_id=self._playback_link_source_id,
-            output_aliases=self._playback_link_source_aliases,
-            input_node_name=self._write_target_name,
-            input_node_id=self._write_target_id,
-            label="write",
-        )
+        start_idx = len(self._linked_pairs)
+        try:
+            self._link_direction(
+                output_node_name=self._playback_link_source_name,
+                output_node_id=self._playback_link_source_id,
+                output_aliases=self._playback_link_source_aliases,
+                input_node_name=self._write_target_name,
+                input_node_id=self._write_target_id,
+                label="write",
+            )
+            self._link_direction(
+                output_node_name=self._capture_source_name,
+                output_node_id=self._capture_source_id,
+                input_node_name=self._capture_link_target_name,
+                input_node_id=self._capture_link_target_id,
+                input_aliases=self._capture_link_target_aliases,
+                label="capture",
+            )
+        except Exception:
+            self._unlink_linked_pairs(start_index=start_idx)
+            raise
+
+    def _unlink_linked_pairs(self, *, start_index: int = 0) -> None:
+        if start_index < 0:
+            start_index = 0
+        if start_index >= len(self._linked_pairs):
+            return
+        to_remove = self._linked_pairs[start_index:]
+        del self._linked_pairs[start_index:]
+        for out_port, in_port in reversed(to_remove):
+            try:
+                _run_pw_link(["-d", out_port, in_port])
+            except Exception:
+                pass
 
     def _link_direction(
         self,
@@ -1150,13 +1236,16 @@ class PipeWireLinkAudioDuplexIO:
         if max_bytes < 1:
             return b""
         if self._rx_fd is None:
-            raise PipeWireRuntimeError("Capture FIFO read fd is not initialized.")
+            raise PipeWireRuntimeError("Capture read fd is not initialized.")
 
         ready, _, _ = select.select([self._rx_fd], [], [], self.read_timeout)
         if not ready:
             return b""
         try:
-            return os.read(self._rx_fd, max_bytes)
+            chunk = os.read(self._rx_fd, max_bytes)
+            if not chunk:
+                return b""
+            return self._normalize_capture_chunk(chunk)
         except BlockingIOError:
             return b""
         except OSError as exc:
@@ -1207,12 +1296,7 @@ class PipeWireLinkAudioDuplexIO:
             return
         self._closed = True
 
-        for out_port, in_port in reversed(self._linked_pairs):
-            try:
-                _run_pw_link(["-d", out_port, in_port])
-            except Exception:
-                pass
-        self._linked_pairs = []
+        self._unlink_linked_pairs(start_index=0)
 
         for proc, close_stdin in (
             (getattr(self, "_playback", None), True),

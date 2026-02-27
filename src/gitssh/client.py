@@ -199,14 +199,7 @@ class GitSSHClient:
             session_id = str(uuid.uuid4())
             state = EndpointState(session_id=session_id)
             cols, rows = self._terminal_size()
-            connect_message = build_message(
-                kind="connect_req",
-                session_id=session_id,
-                source="client",
-                target="server",
-                seq=state.outgoing_seq.next(),
-                body={"host": host, "pty": {"cols": cols, "rows": rows}},
-            )
+            connect_body = {"host": host, "pty": {"cols": cols, "rows": rows}}
 
             deadline = time.monotonic() + self.config.connect_timeout
             next_send = 0.0
@@ -216,9 +209,20 @@ class GitSSHClient:
             while time.monotonic() < deadline:
                 now = time.monotonic()
                 if now >= next_send:
+                    connect_message = build_message(
+                        kind="connect_req",
+                        session_id=session_id,
+                        source="client",
+                        target="server",
+                        seq=state.outgoing_seq.next(),
+                        body=connect_body,
+                    )
                     self._write_message(connect_message)
                     next_send = now + self.config.retry_interval
-                    self._log(f"sent connect_req for session {session_id}")
+                    self._log(
+                        f"sent connect_req for session {session_id} "
+                        f"(msg_id={connect_message.msg_id}, seq={connect_message.seq})"
+                    )
 
                 for incoming in self._read_messages():
                     if incoming.target != "client" or incoming.source != "server":
@@ -858,6 +862,8 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
         outbound_branch=args.branch_c2s,
         auto_init_local=True,
     )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
