@@ -37,6 +37,7 @@ from .transport import TransportBackend, TransportError
 from .usb_serial_transport import USBSerialTransportBackend, USBSerialTransportConfig
 
 DIAG_IDLE_SESSION_ID = "00000000-0000-0000-0000-000000000001"
+_CONNECT_ACK_BURST_GAP_SEC = 0.04
 
 
 @dataclass
@@ -51,6 +52,7 @@ class ServerConfig:
     diag: bool = False
     diag_interval: float = 1.0
     diag_connect_burst: int = 3
+    connect_ack_burst: int = 5
     verbose: bool = False
 
 
@@ -291,6 +293,25 @@ class GitSSHServer:
             "prompt": self._collect_prompt_context(),
         }
 
+    def _effective_connect_ack_burst(self) -> int:
+        if not self.backend.name().startswith("audio-modem:"):
+            return 1
+        return max(self.config.connect_ack_burst, 1)
+
+    def _emit_connect_ack_burst(self, *, session_id: str, body: dict[str, Any]) -> None:
+        count = self._effective_connect_ack_burst()
+        for idx in range(count):
+            self._write_message(
+                self._make_message(
+                    kind="connect_ack",
+                    session_id=session_id,
+                    body=dict(body),
+                )
+            )
+            if idx + 1 >= count:
+                continue
+            time.sleep(_CONNECT_ACK_BURST_GAP_SEC)
+
     def _handle_connect(self, message: Message) -> None:
         self._emit_diag_connect_burst(
             session_id=message.session_id,
@@ -306,15 +327,12 @@ class GitSSHServer:
                     phase="connect_req_reack",
                     body={"stream_id": self._active.stream_id},
                 )
-                self._write_message(
-                    self._make_message(
-                        kind="connect_ack",
-                        session_id=message.session_id,
-                        body=self._connect_ack_body(
-                            stream_id=self._active.stream_id,
-                            shell_path=self._active.shell.shell_path,
-                        ),
-                    )
+                self._emit_connect_ack_burst(
+                    session_id=message.session_id,
+                    body=self._connect_ack_body(
+                        stream_id=self._active.stream_id,
+                        shell_path=self._active.shell.shell_path,
+                    ),
                 )
                 return
 
@@ -361,12 +379,9 @@ class GitSSHServer:
             phase="connect_ack_enqueued",
             body={"stream_id": stream_id, "shell": shell_path},
         )
-        self._write_message(
-            self._make_message(
-                kind="connect_ack",
-                session_id=message.session_id,
-                body=self._connect_ack_body(stream_id=stream_id, shell_path=shell_path),
-            )
+        self._emit_connect_ack_burst(
+            session_id=message.session_id,
+            body=self._connect_ack_body(stream_id=stream_id, shell_path=shell_path),
         )
 
     def _emit_pty_output(self, session: ActiveSession, payload: bytes) -> None:
@@ -819,6 +834,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=3,
         help="Number of diagnostic pings to emit for each connect_req handling phase",
     )
+    parser.add_argument(
+        "--connect-ack-burst",
+        type=int,
+        default=5,
+        help="Number of connect_ack frames to emit for connect handling (audio-modem only)",
+    )
     return parser
 
 
@@ -919,6 +940,7 @@ def main(argv: list[str] | None = None) -> int:
         diag=args.diag,
         diag_interval=max(args.diag_interval_ms / 1000.0, 0.0),
         diag_connect_burst=max(args.diag_connect_burst, 1),
+        connect_ack_burst=max(args.connect_ack_burst, 1),
         verbose=args.verbose,
     )
 

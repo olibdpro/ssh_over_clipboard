@@ -237,6 +237,7 @@ class GitServerCliTests(unittest.TestCase):
         self.assertFalse(args.diag)
         self.assertEqual(args.diag_interval_ms, 1000)
         self.assertEqual(args.diag_connect_burst, 3)
+        self.assertEqual(args.connect_ack_burst, 5)
 
     def test_supports_usb_serial_transport_options(self) -> None:
         args = build_server_parser().parse_args(
@@ -284,6 +285,15 @@ class GitServerCliTests(unittest.TestCase):
         self.assertTrue(args.diag)
         self.assertEqual(args.diag_interval_ms, 250)
         self.assertEqual(args.diag_connect_burst, 7)
+
+    def test_supports_connect_ack_burst_option(self) -> None:
+        args = build_server_parser().parse_args(
+            [
+                "--connect-ack-burst",
+                "9",
+            ]
+        )
+        self.assertEqual(args.connect_ack_burst, 9)
 
     def test_server_rejects_legacy_audio_backend_flag(self) -> None:
         with self.assertRaises(SystemExit):
