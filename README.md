@@ -281,6 +281,9 @@ sshg localhost \
   --audio-modulation pcoip-safe
 ```
 
+`pcoip-safe` is tuned for higher control-path throughput than the baseline resilient profile.
+If your environment is noisier and decode stability regresses, fall back to `--audio-modulation robust-v1`.
+
 ## Protocol Notes
 
 Clipboard messages use this wire prefix:

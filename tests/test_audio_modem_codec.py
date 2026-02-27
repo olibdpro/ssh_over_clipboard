@@ -78,8 +78,40 @@ class AudioFrameCodecTests(unittest.TestCase):
             marker_run=16,
         )
         self.assertIsInstance(codec, RobustFskFrameCodec)
-        self.assertEqual(codec.symbol_rate, 900)
-        self.assertEqual(codec.bit_repeat, 5)
+        self.assertEqual(codec.symbol_rate, 1800)
+        self.assertEqual(codec.bit_repeat, 3)
+        self.assertEqual(codec.preamble_pairs, 8)
+        self.assertEqual(codec.start_gate_tail_symbols, 8)
+        self.assertEqual(codec.start_max_errors, 3)
+        self.assertEqual(codec.end_max_errors, 2)
+
+    def test_pcoip_safe_round_trip_frame(self) -> None:
+        codec = create_audio_frame_codec(
+            modulation="pcoip-safe",
+            sample_rate=48000,
+            byte_repeat=3,
+            marker_run=16,
+        )
+        payload = b"pcoip-safe-roundtrip"
+        pcm = codec.encode_frame(payload)
+        frames = codec.feed_pcm(pcm)
+        self.assertEqual(frames, [payload])
+
+    def test_pcoip_safe_encoded_frame_is_shorter_than_conservative_profile(self) -> None:
+        payload = b"A" * 320
+        fast = create_audio_frame_codec(
+            modulation="pcoip-safe",
+            sample_rate=48000,
+            byte_repeat=3,
+            marker_run=16,
+        )
+        slow = RobustFskFrameCodec(
+            sample_rate=48000,
+            symbol_rate=900,
+            bit_repeat=5,
+            amplitude=13000,
+        )
+        self.assertLess(len(fast.encode_frame(payload)), len(slow.encode_frame(payload)))
 
 
 if __name__ == "__main__":

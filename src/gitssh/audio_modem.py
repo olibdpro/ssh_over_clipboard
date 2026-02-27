@@ -79,12 +79,17 @@ def create_audio_frame_codec(
 
     if effective == MODULATION_PCOIP_SAFE:
         # PCoIP voice channels commonly apply lossy coding and dynamic bandwidth shaping.
-        # Trade throughput for resilience while keeping interactive setup latency practical.
+        # Bias toward higher throughput for interactive control traffic while keeping
+        # enough redundancy/sync tolerance to survive typical remoting losses.
         return RobustFskFrameCodec(
             sample_rate=max(sample_rate, 8000),
-            symbol_rate=900,
-            bit_repeat=5,
+            symbol_rate=1800,
+            bit_repeat=3,
             amplitude=13000,
+            preamble_pairs=8,
+            start_gate_tail_symbols=8,
+            start_max_errors=3,
+            end_max_errors=2,
         )
 
     # Should never happen due normalization guard.
@@ -283,6 +288,8 @@ class RobustFskFrameCodec:
     """More resilient voice-band 4-FSK framing for lossy/processed links."""
 
     _FREQS = (1200.0, 1800.0, 2400.0, 3000.0)
+    _DEFAULT_START_SYNC = [0, 1, 3, 2, 0, 2, 3, 1, 1, 3, 0, 2, 2, 0, 1, 3]
+    _DEFAULT_END_SYNC = [3, 2, 0, 1, 3, 1, 0, 2, 2, 0, 3, 1, 1, 3, 2, 0]
 
     def __init__(
         self,
@@ -291,12 +298,21 @@ class RobustFskFrameCodec:
         symbol_rate: int = 1200,
         bit_repeat: int = 3,
         amplitude: int = 9000,
+        preamble_pairs: int = 32,
+        start_sync: list[int] | None = None,
+        end_sync: list[int] | None = None,
+        start_gate_tail_symbols: int = 16,
+        start_max_errors: int = 2,
+        end_max_errors: int = 1,
     ) -> None:
         self.sample_rate = max(sample_rate, 8000)
         self.symbol_rate = max(symbol_rate, 100)
         self.samples_per_symbol = max(int(round(self.sample_rate / float(self.symbol_rate))), 8)
         self.bit_repeat = max(bit_repeat, 1)
         self.amplitude = max(min(amplitude, 20000), 1000)
+        self.preamble_pairs = max(preamble_pairs, 1)
+        self.start_max_errors = max(start_max_errors, 0)
+        self.end_max_errors = max(end_max_errors, 0)
 
         self._phase = 0.0
         self._sample_buffer = bytearray()
@@ -306,11 +322,16 @@ class RobustFskFrameCodec:
         self._steps = tuple((2.0 * math.pi * freq) / float(self.sample_rate) for freq in self._FREQS)
         self._goertzel_coeffs = tuple(2.0 * math.cos(step) for step in self._steps)
 
-        preamble_base = [0, 3] * 32
-        self._preamble = preamble_base[:64]
-        self._start_sync = [0, 1, 3, 2, 0, 2, 3, 1, 1, 3, 0, 2, 2, 0, 1, 3]
-        self._end_sync = [3, 2, 0, 1, 3, 1, 0, 2, 2, 0, 3, 1, 1, 3, 2, 0]
-        self._start_gate = self._preamble[-16:] + self._start_sync
+        preamble_base = [0, 3] * self.preamble_pairs
+        self._preamble = preamble_base[: self.preamble_pairs * 2]
+        start_sync_values = list(start_sync or self._DEFAULT_START_SYNC)
+        end_sync_values = list(end_sync or self._DEFAULT_END_SYNC)
+        if not start_sync_values or not end_sync_values:
+            raise AudioCodecError("Robust FSK sync patterns cannot be empty.")
+        self._start_sync = [int(symbol) & 0x3 for symbol in start_sync_values]
+        self._end_sync = [int(symbol) & 0x3 for symbol in end_sync_values]
+        self.start_gate_tail_symbols = min(max(start_gate_tail_symbols, 1), len(self._preamble))
+        self._start_gate = self._preamble[-self.start_gate_tail_symbols :] + self._start_sync
 
         self._frames_decoded = 0
         self._crc_failures = 0
@@ -350,7 +371,12 @@ class RobustFskFrameCodec:
 
         frames: list[bytes] = []
         while True:
-            start_idx = _find_symbol_pattern(self._symbol_buffer, self._start_gate, start=0, max_errors=2)
+            start_idx = _find_symbol_pattern(
+                self._symbol_buffer,
+                self._start_gate,
+                start=0,
+                max_errors=self.start_max_errors,
+            )
             if start_idx < 0:
                 keep = max(len(self._start_gate) * 2, 256)
                 if len(self._symbol_buffer) > keep:
@@ -362,7 +388,7 @@ class RobustFskFrameCodec:
                 self._symbol_buffer,
                 self._end_sync,
                 start=data_start,
-                max_errors=1,
+                max_errors=self.end_max_errors,
             )
             if end_idx < 0:
                 if start_idx > 0:

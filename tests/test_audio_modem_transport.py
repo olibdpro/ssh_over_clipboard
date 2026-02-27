@@ -214,6 +214,38 @@ class AudioModemTransportTests(unittest.TestCase):
             backend_a.close()
             backend_b.close()
 
+    def test_round_trip_message_delivery_with_pcoip_safe_modulation(self) -> None:
+        backend_a, backend_b = self._make_pair(modulation="pcoip-safe")
+        try:
+            cursor = backend_b.snapshot_inbound_cursor()
+            message = build_message(
+                kind="connect_req",
+                session_id=str(uuid.uuid4()),
+                source="client",
+                target="server",
+                seq=1,
+                body={"host": "localhost"},
+            )
+            backend_a.write_outbound_message(message)
+
+            received = []
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and not received:
+                backend_a.push_outbound()
+                backend_b.fetch_inbound()
+                backend_b.push_outbound()
+                backend_a.fetch_inbound()
+                messages, cursor = backend_b.read_inbound_messages(cursor)
+                if messages:
+                    received.extend(messages)
+                time.sleep(0.005)
+
+            self.assertEqual(len(received), 1)
+            self.assertEqual(received[0].msg_id, message.msg_id)
+        finally:
+            backend_a.close()
+            backend_b.close()
+
     def test_transient_write_failure_does_not_stall_retransmit_queue(self) -> None:
         endpoint_a = _FailOnceWriteEndpoint()
         endpoint_b = _LoopAudioEndpoint()
