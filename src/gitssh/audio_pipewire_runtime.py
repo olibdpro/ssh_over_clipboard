@@ -645,7 +645,7 @@ def _node_for_id(node_id: int) -> PipeWireNode:
 
 
 class PipeWireLinkAudioDuplexIO:
-    """Duplex PCM I/O using pw-record/pw-play with explicit pw-link routing."""
+    """Duplex PCM I/O using pw-record + tail and pw-play with explicit pw-link routing."""
 
     def __init__(
         self,
@@ -662,6 +662,7 @@ class PipeWireLinkAudioDuplexIO:
         self.write_timeout = max(write_timeout, 0.0)
         self._linked_pairs: list[tuple[str, str]] = []
         self._capture: subprocess.Popen[bytes] | None = None
+        self._capture_tail: subprocess.Popen[bytes] | None = None
         self._playback: subprocess.Popen[bytes] | None = None
         self._rx_fd: int | None = None
         self._tx_fd: int | None = None
@@ -720,7 +721,6 @@ class PipeWireLinkAudioDuplexIO:
 
         self._touch_capture_file(self._capture_file_path)
         self._create_fifo(self._playback_fifo_path, label="playback")
-        self._rx_fd = self._open_capture_file_for_read(self._capture_file_path)
         self._playback_fifo_dummy_rx_fd = self._open_fifo_for_read(
             self._playback_fifo_path,
             label="playback bootstrap",
@@ -763,6 +763,13 @@ class PipeWireLinkAudioDuplexIO:
             "30ms",
             self._playback_fifo_path,
         ]
+        capture_tail_cmd = [
+            "tail",
+            "-c",
+            "+1",
+            "-f",
+            self._capture_file_path,
+        ]
 
         try:
             self._capture = subprocess.Popen(
@@ -782,17 +789,44 @@ class PipeWireLinkAudioDuplexIO:
                 env=playback_env,
             )
         except FileNotFoundError as exc:
+            self.close()
             raise PipeWireRuntimeError(
                 "pw-record/pw-play executable not found; install PipeWire CLI tools."
             ) from exc
         except Exception as exc:
+            self.close()
             raise PipeWireRuntimeError(f"Failed to start pw-record/pw-play pipelines: {exc}") from exc
+
+        try:
+            self._capture_tail = subprocess.Popen(
+                capture_tail_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=True,
+            )
+        except FileNotFoundError as exc:
+            self.close()
+            raise PipeWireRuntimeError(
+                "tail executable not found; install coreutils tail for PipeWire capture streaming."
+            ) from exc
+        except Exception as exc:
+            self.close()
+            raise PipeWireRuntimeError(f"Failed to start tail capture sidecar: {exc}") from exc
+
+        if self._capture_tail.stdout is None:
+            self.close()
+            raise PipeWireRuntimeError("Failed to initialize tail capture stream pipe.")
+        self._rx_fd = self._capture_tail.stdout.fileno()
+        os.set_blocking(self._rx_fd, False)
 
         try:
             if self._capture.poll() is not None:
                 raise PipeWireRuntimeError(_process_stderr(self._capture, "pw-record capture"))
             if self._playback.poll() is not None:
                 raise PipeWireRuntimeError(_process_stderr(self._playback, "pw-play playback"))
+            if self._capture_tail.poll() is not None:
+                raise PipeWireRuntimeError(_process_stderr(self._capture_tail, "tail capture stream"))
 
             self._wait_for_process_stability()
             self._close_fd("_playback_fifo_dummy_rx_fd")
@@ -1044,14 +1078,6 @@ class PipeWireLinkAudioDuplexIO:
                 except OSError:
                     pass
 
-    def _open_capture_file_for_read(self, path: str) -> int:
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-        except Exception as exc:
-            raise PipeWireRuntimeError(f"Failed to open capture file for read '{path}': {exc}") from exc
-        os.set_blocking(fd, False)
-        return fd
-
     def _normalize_capture_chunk(self, chunk: bytes) -> bytes:
         if self._capture_header_skipped:
             return chunk
@@ -1117,6 +1143,8 @@ class PipeWireLinkAudioDuplexIO:
                 raise PipeWireRuntimeError(_process_stderr(self._capture, "pw-record capture"))
             if self._playback.poll() is not None:
                 raise PipeWireRuntimeError(_process_stderr(self._playback, "pw-play playback"))
+            if self._capture_tail.poll() is not None:
+                raise PipeWireRuntimeError(_process_stderr(self._capture_tail, "tail capture stream"))
             time.sleep(0.01)
 
     def _ensure_links_ready(self) -> None:
@@ -1233,6 +1261,8 @@ class PipeWireLinkAudioDuplexIO:
             return b""
         if self._capture.poll() is not None:
             raise PipeWireRuntimeError(_process_stderr(self._capture, "pw-record capture"))
+        if self._capture_tail.poll() is not None:
+            raise PipeWireRuntimeError(_process_stderr(self._capture_tail, "tail capture stream"))
         if max_bytes < 1:
             return b""
         if self._rx_fd is None:
@@ -1251,7 +1281,7 @@ class PipeWireLinkAudioDuplexIO:
         except OSError as exc:
             if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
                 return b""
-            raise PipeWireRuntimeError(f"pw-record capture read failed: {exc}") from exc
+            raise PipeWireRuntimeError(f"tail capture read failed: {exc}") from exc
 
     def write(self, data: bytes) -> None:
         if self._closed or not data:
@@ -1301,12 +1331,20 @@ class PipeWireLinkAudioDuplexIO:
         for proc, close_stdin in (
             (getattr(self, "_playback", None), True),
             (getattr(self, "_capture", None), False),
+            (getattr(self, "_capture_tail", None), False),
         ):
             if proc is None:
                 continue
             try:
                 if close_stdin and proc.stdin is not None:
                     proc.stdin.close()
+            except OSError:
+                pass
+            try:
+                if proc.stdout is not None:
+                    close_stdout = getattr(proc.stdout, "close", None)
+                    if callable(close_stdout):
+                        close_stdout()
             except OSError:
                 pass
             if proc.poll() is None:

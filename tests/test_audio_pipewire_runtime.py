@@ -333,7 +333,7 @@ class PipeWireRuntimeTests(unittest.TestCase):
             mock.patch("gitssh.audio_pipewire_runtime.os.unlink") as unlink,
             mock.patch(
                 "gitssh.audio_pipewire_runtime.subprocess.Popen",
-                side_effect=[capture_proc, playback_proc],
+                side_effect=[capture_proc, playback_proc, _FakeProc(stdout_fd=201)],
             ) as popen,
             mock.patch(
                 "gitssh.audio_pipewire_runtime._ports_for_node",
@@ -369,17 +369,20 @@ class PipeWireRuntimeTests(unittest.TestCase):
 
         capture_cmd = popen.call_args_list[0].args[0]
         playback_cmd = popen.call_args_list[1].args[0]
+        tail_cmd = popen.call_args_list[2].args[0]
         self.assertEqual(capture_cmd[0], "pw-record")
         self.assertEqual(playback_cmd[0], "pw-play")
+        self.assertEqual(tail_cmd[:4], ["tail", "-c", "+1", "-f"])
         self.assertEqual(capture_cmd[capture_cmd.index("--target") + 1], "49")
         self.assertEqual(playback_cmd[playback_cmd.index("--target") + 1], "44")
         self.assertEqual(capture_cmd[-1], capture_file)
         self.assertEqual(playback_cmd[-1], playback_fifo)
+        self.assertEqual(tail_cmd[-1], capture_file)
 
         unlink.assert_any_call(capture_file)
         unlink.assert_any_call(playback_fifo)
 
-    def test_duplex_capture_opens_regular_file_reader_fd(self) -> None:
+    def test_duplex_capture_reads_from_tail_stdout_fd(self) -> None:
         nodes = [
             PipeWireNode(49, "capture.node", "capture", "app", "Stream/Output/Audio"),
             PipeWireNode(44, "write.node", "write", "app", "Stream/Input/Audio"),
@@ -396,7 +399,7 @@ class PipeWireRuntimeTests(unittest.TestCase):
             mock.patch("gitssh.audio_pipewire_runtime.os.unlink"),
             mock.patch(
                 "gitssh.audio_pipewire_runtime.subprocess.Popen",
-                side_effect=[capture_proc, playback_proc],
+                side_effect=[capture_proc, playback_proc, _FakeProc(stdout_fd=201)],
             ),
             mock.patch(
                 "gitssh.audio_pipewire_runtime._ports_for_node",
@@ -420,8 +423,8 @@ class PipeWireRuntimeTests(unittest.TestCase):
                 read_timeout=0.01,
                 write_timeout=0.05,
             )
-            self.assertEqual(io_obj._rx_fd, 101)
-            set_blocking_mock.assert_any_call(101, False)
+            self.assertEqual(io_obj._rx_fd, 201)
+            set_blocking_mock.assert_any_call(201, False)
             io_obj.close()
 
     def test_duplex_read_returns_stream_data_when_ready(self) -> None:
@@ -443,7 +446,7 @@ class PipeWireRuntimeTests(unittest.TestCase):
             mock.patch("gitssh.audio_pipewire_runtime.os.unlink"),
             mock.patch(
                 "gitssh.audio_pipewire_runtime.subprocess.Popen",
-                side_effect=[capture_proc, playback_proc],
+                side_effect=[capture_proc, playback_proc, _FakeProc(stdout_fd=201)],
             ),
             mock.patch(
                 "gitssh.audio_pipewire_runtime._ports_for_node",
@@ -459,7 +462,7 @@ class PipeWireRuntimeTests(unittest.TestCase):
             ),
             mock.patch.object(PipeWireLinkAudioDuplexIO, "_wait_for_process_stability", return_value=None),
             mock.patch.object(PipeWireLinkAudioDuplexIO, "_ensure_links_ready", return_value=None),
-            mock.patch("gitssh.audio_pipewire_runtime.select.select", return_value=([101], [], [])),
+            mock.patch("gitssh.audio_pipewire_runtime.select.select", return_value=([201], [], [])),
             mock.patch("gitssh.audio_pipewire_runtime.os.read", return_value=wav_header + b"\x01\x02\x03"),
         ):
             io_obj = PipeWireLinkAudioDuplexIO(
@@ -490,7 +493,7 @@ class PipeWireRuntimeTests(unittest.TestCase):
             mock.patch("gitssh.audio_pipewire_runtime.os.unlink"),
             mock.patch(
                 "gitssh.audio_pipewire_runtime.subprocess.Popen",
-                side_effect=[capture_proc, playback_proc],
+                side_effect=[capture_proc, playback_proc, _FakeProc(stdout_fd=201)],
             ),
             mock.patch(
                 "gitssh.audio_pipewire_runtime._ports_for_node",
@@ -536,7 +539,7 @@ class PipeWireRuntimeTests(unittest.TestCase):
             mock.patch("gitssh.audio_pipewire_runtime.os.unlink") as unlink,
             mock.patch(
                 "gitssh.audio_pipewire_runtime.subprocess.Popen",
-                side_effect=[capture_proc, playback_proc],
+                side_effect=[capture_proc, playback_proc, _FakeProc(stdout_fd=201)],
             ) as popen,
             mock.patch(
                 "gitssh.audio_pipewire_runtime._ports_for_node",
@@ -595,7 +598,7 @@ class PipeWireRuntimeTests(unittest.TestCase):
             mock.patch("gitssh.audio_pipewire_runtime.os.unlink"),
             mock.patch(
                 "gitssh.audio_pipewire_runtime.subprocess.Popen",
-                side_effect=[capture_proc, playback_proc],
+                side_effect=[capture_proc, playback_proc, _FakeProc(stdout_fd=201)],
             ) as popen,
             mock.patch(
                 "gitssh.audio_pipewire_runtime._ports_for_node",
@@ -701,7 +704,7 @@ class PipeWireRuntimeTests(unittest.TestCase):
             mock.patch("gitssh.audio_pipewire_runtime.os.unlink"),
             mock.patch(
                 "gitssh.audio_pipewire_runtime.subprocess.Popen",
-                side_effect=[capture_proc, playback_proc],
+                side_effect=[capture_proc, playback_proc, _FakeProc(stdout_fd=201)],
             ),
             mock.patch("gitssh.audio_pipewire_runtime._ports_for_node", side_effect=_fake_ports_for_node),
             mock.patch.object(
@@ -775,7 +778,7 @@ class PipeWireRuntimeTests(unittest.TestCase):
             ),
             mock.patch(
                 "gitssh.audio_pipewire_runtime.subprocess.Popen",
-                side_effect=[capture_proc, playback_proc],
+                side_effect=[capture_proc, playback_proc, _FakeProc(stdout_fd=201)],
             ) as popen,
             mock.patch.object(PipeWireLinkAudioDuplexIO, "_wait_for_process_stability", return_value=None),
             mock.patch.object(PipeWireLinkAudioDuplexIO, "_ensure_links_ready") as ensure_links_ready,
@@ -830,11 +833,11 @@ class PipeWireRuntimeTests(unittest.TestCase):
             ),
             mock.patch(
                 "gitssh.audio_pipewire_runtime.subprocess.Popen",
-                side_effect=[capture_proc, playback_proc],
+                side_effect=[capture_proc, playback_proc, _FakeProc(stdout_fd=201)],
             ),
             mock.patch.object(PipeWireLinkAudioDuplexIO, "_wait_for_process_stability", return_value=None),
             mock.patch.object(PipeWireLinkAudioDuplexIO, "_ensure_links_ready", return_value=None),
-            mock.patch("gitssh.audio_pipewire_runtime.select.select", return_value=([], [103], [])),
+            mock.patch("gitssh.audio_pipewire_runtime.select.select", return_value=([], [102], [])),
             mock.patch("gitssh.audio_pipewire_runtime.os.write", side_effect=_fake_write),
         ):
             io_obj = PipeWireLinkAudioDuplexIO(
@@ -853,6 +856,51 @@ class PipeWireRuntimeTests(unittest.TestCase):
         self.assertEqual(writes[0][8:12], b"WAVE")
         self.assertEqual(writes[1], b"\x01\x02\x03\x04")
         self.assertEqual(writes[2], b"\x05\x06")
+
+    def test_duplex_raises_when_tail_binary_is_missing(self) -> None:
+        nodes = [
+            PipeWireNode(49, "capture.node", "capture", "app", "Stream/Output/Audio"),
+            PipeWireNode(44, "write.node", "write", "app", "Stream/Input/Audio"),
+        ]
+        capture_proc = _FakeProc()
+        playback_proc = _FakeProc()
+
+        with (
+            mock.patch("gitssh.audio_pipewire_runtime.list_nodes", return_value=nodes),
+            mock.patch("gitssh.audio_pipewire_runtime.os.mkfifo"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.open", side_effect=[100, 101, 102, 103]),
+            mock.patch("gitssh.audio_pipewire_runtime.os.set_blocking"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.close"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.unlink"),
+            mock.patch(
+                "gitssh.audio_pipewire_runtime.subprocess.Popen",
+                side_effect=[capture_proc, playback_proc, FileNotFoundError("tail missing")],
+            ),
+            mock.patch(
+                "gitssh.audio_pipewire_runtime._ports_for_node",
+                side_effect=[
+                    (["capture.node:monitor_FL"], "capture.node:monitor_FL"),
+                    (["write.node:input_FL"], "write.node:input_FL"),
+                ],
+            ),
+            mock.patch.object(
+                PipeWireLinkAudioDuplexIO,
+                "_pipewire_has_visible_ports",
+                return_value=True,
+            ),
+            mock.patch.object(PipeWireLinkAudioDuplexIO, "_wait_for_process_stability", return_value=None),
+            mock.patch.object(PipeWireLinkAudioDuplexIO, "_ensure_links_ready", return_value=None),
+        ):
+            with self.assertRaises(PipeWireRuntimeError) as ctx:
+                PipeWireLinkAudioDuplexIO(
+                    capture_node_id=49,
+                    write_node_id=44,
+                    sample_rate=48000,
+                    read_timeout=0.01,
+                    write_timeout=0.05,
+                )
+
+        self.assertIn("tail executable not found", str(ctx.exception))
 
     def test_duplex_fallback_keeps_selected_stream_targets_when_no_ports(self) -> None:
         nodes = [
@@ -885,7 +933,7 @@ class PipeWireRuntimeTests(unittest.TestCase):
             ),
             mock.patch(
                 "gitssh.audio_pipewire_runtime.subprocess.Popen",
-                side_effect=[capture_proc, playback_proc],
+                side_effect=[capture_proc, playback_proc, _FakeProc(stdout_fd=201)],
             ) as popen,
             mock.patch.object(PipeWireLinkAudioDuplexIO, "_wait_for_process_stability", return_value=None),
             mock.patch.object(PipeWireLinkAudioDuplexIO, "_ensure_links_ready") as ensure_links_ready,
