@@ -12,7 +12,7 @@ import struct
 import subprocess
 import sys
 import time
-from typing import Callable, TextIO
+from typing import TextIO
 
 from .audio_io_ffmpeg import AudioIOError
 
@@ -28,34 +28,6 @@ class PipeWireNode:
     node_description: str
     app_name: str
     media_class: str
-
-
-@dataclass(frozen=True)
-class PipeWirePlaybackStream:
-    stream_index: int
-    node_id: int | None
-    sink_id: int | None
-    app_name: str
-    media_name: str
-    process_binary: str
-
-
-@dataclass(frozen=True)
-class PipeWireRecordStream:
-    stream_index: int
-    node_id: int | None
-    source_id: int | None
-    app_name: str
-    media_name: str
-    process_binary: str
-
-
-@dataclass(frozen=True)
-class PipeWireNodeCandidate:
-    node: PipeWireNode
-    display_text: str
-    match_text: str
-    is_stream_backed: bool = False
 
 
 @dataclass(frozen=True)
@@ -116,38 +88,6 @@ def _run_pw_cli(args: list[str]) -> str:
 
 def _run_pw_link(args: list[str]) -> str:
     return _run_command(["pw-link", *args], friendly_name=f"pw-link {' '.join(args)}")
-
-
-def _run_pactl(args: list[str]) -> str:
-    return _run_command(["pactl", *args], friendly_name=f"pactl {' '.join(args)}")
-
-
-def _to_int(value: object) -> int | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, str):
-        text = value.strip()
-        if not text:
-            return None
-        try:
-            return int(text)
-        except ValueError:
-            return None
-    return None
-
-
-def _to_bool(value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"true", "yes", "1"}:
-            return True
-        if lowered in {"false", "no", "0"}:
-            return False
-    return bool(value)
 
 
 def _systemctl_user_unit_state(unit_name: str) -> str | None:
@@ -348,175 +288,9 @@ def list_write_nodes() -> list[PipeWireNode]:
     return [node for node in list_nodes() if _is_write_candidate(node)]
 
 
-def _stream_meta_text(*, app_name: str, media_name: str, process_binary: str) -> str:
-    app = app_name.strip() or "unknown-app"
-    media = media_name.strip() or "unknown-media"
-    binary = process_binary.strip() or "unknown-bin"
-    return f"app={app} media={media} bin={binary}"
-
-
-def _load_pactl_json(args: list[str]) -> list[dict[str, object]]:
-    try:
-        payload_text = _run_pactl(args)
-    except PipeWireRuntimeError:
-        return []
-
-    try:
-        payload = json.loads(payload_text or "[]")
-    except json.JSONDecodeError:
-        return []
-
-    if not isinstance(payload, list):
-        return []
-    return [item for item in payload if isinstance(item, dict)]
-
-
-def list_active_playback_streams() -> list[PipeWirePlaybackStream]:
-    streams: list[PipeWirePlaybackStream] = []
-    for item in _load_pactl_json(["-f", "json", "list", "sink-inputs"]):
-        stream_index = _to_int(item.get("index"))
-        if stream_index is None:
-            continue
-
-        properties = item.get("properties")
-        props = properties if isinstance(properties, dict) else {}
-        state = str(item.get("state", "") or "").strip().lower()
-        corked = _to_bool(item.get("corked"))
-        if corked or state == "corked":
-            continue
-
-        streams.append(
-            PipeWirePlaybackStream(
-                stream_index=stream_index,
-                node_id=_to_int(props.get("object.id")),
-                sink_id=_to_int(item.get("sink")),
-                app_name=str(props.get("application.name", "") or ""),
-                media_name=str(props.get("media.name", "") or ""),
-                process_binary=str(props.get("application.process.binary", "") or ""),
-            )
-        )
-
-    streams.sort(key=lambda stream: stream.stream_index, reverse=True)
-    return streams
-
-
-def _is_utility_record_stream(stream: PipeWireRecordStream) -> bool:
-    app = stream.app_name.strip().lower()
-    media = stream.media_name.strip().lower()
-    binary = stream.process_binary.strip().lower()
-    if media == "peak detect":
-        return True
-    if app == "pulseaudio volume control":
-        return True
-    if binary == "pavucontrol":
-        return True
-    return False
-
-
-def list_active_record_streams() -> list[PipeWireRecordStream]:
-    streams: list[PipeWireRecordStream] = []
-    for item in _load_pactl_json(["-f", "json", "list", "source-outputs"]):
-        stream_index = _to_int(item.get("index"))
-        if stream_index is None:
-            continue
-
-        properties = item.get("properties")
-        props = properties if isinstance(properties, dict) else {}
-        corked = _to_bool(item.get("corked"))
-        if corked:
-            continue
-
-        streams.append(
-            PipeWireRecordStream(
-                stream_index=stream_index,
-                node_id=_to_int(props.get("object.id")),
-                source_id=_to_int(item.get("source")),
-                app_name=str(props.get("application.name", "") or ""),
-                media_name=str(props.get("media.name", "") or ""),
-                process_binary=str(props.get("application.process.binary", "") or ""),
-            )
-        )
-
-    streams.sort(key=lambda stream: stream.stream_index, reverse=True)
-    non_utility = [stream for stream in streams if not _is_utility_record_stream(stream)]
-    if non_utility:
-        return non_utility
-    return streams
-
-
-def _build_node_candidates(
-    *,
-    nodes: list[PipeWireNode],
-    stream_metadata_by_node: dict[int, list[str]],
-) -> list[PipeWireNodeCandidate]:
-    stream_backed: list[PipeWireNodeCandidate] = []
-    generic: list[PipeWireNodeCandidate] = []
-
-    for node in nodes:
-        base = describe_node(node)
-        stream_descriptions = stream_metadata_by_node.get(node.node_id, [])
-        if stream_descriptions:
-            headline = stream_descriptions[0]
-            if len(stream_descriptions) > 1:
-                headline = f"{headline}; +{len(stream_descriptions) - 1} more stream(s)"
-            display = f"{base} stream={headline}"
-            match_text = f"{display} {' '.join(stream_descriptions)}"
-            stream_backed.append(
-                PipeWireNodeCandidate(
-                    node=node,
-                    display_text=display,
-                    match_text=match_text,
-                    is_stream_backed=True,
-                )
-            )
-        else:
-            generic.append(
-                PipeWireNodeCandidate(
-                    node=node,
-                    display_text=base,
-                    match_text=base,
-                    is_stream_backed=False,
-                )
-            )
-
-    return [*stream_backed, *generic]
-
-
-def _capture_node_candidates() -> list[PipeWireNodeCandidate]:
-    nodes = list_capture_nodes()
-    stream_metadata_by_node: dict[int, list[str]] = {}
-    for stream in list_active_playback_streams():
-        if stream.node_id is None:
-            continue
-        sink = str(stream.sink_id) if stream.sink_id is not None else "?"
-        description = (
-            f"idx={stream.stream_index} "
-            f"{_stream_meta_text(app_name=stream.app_name, media_name=stream.media_name, process_binary=stream.process_binary)} "
-            f"sink={sink}"
-        )
-        stream_metadata_by_node.setdefault(stream.node_id, []).append(description)
-    return _build_node_candidates(nodes=nodes, stream_metadata_by_node=stream_metadata_by_node)
-
-
-def _write_node_candidates() -> list[PipeWireNodeCandidate]:
-    nodes = list_write_nodes()
-    stream_metadata_by_node: dict[int, list[str]] = {}
-    for stream in list_active_record_streams():
-        if stream.node_id is None:
-            continue
-        source = str(stream.source_id) if stream.source_id is not None else "?"
-        description = (
-            f"idx={stream.stream_index} "
-            f"{_stream_meta_text(app_name=stream.app_name, media_name=stream.media_name, process_binary=stream.process_binary)} "
-            f"source={source}"
-        )
-        stream_metadata_by_node.setdefault(stream.node_id, []).append(description)
-    return _build_node_candidates(nodes=nodes, stream_metadata_by_node=stream_metadata_by_node)
-
-
 def _resolve_node_id(
     *,
-    candidate_provider: Callable[[], list[PipeWireNodeCandidate]],
+    nodes: list[PipeWireNode],
     requested_id: int | None,
     requested_match: str | None,
     interactive: bool,
@@ -525,14 +299,12 @@ def _resolve_node_id(
     input_stream: TextIO,
     output_stream: TextIO,
 ) -> int:
-    candidates = candidate_provider()
-
     if requested_id is not None:
-        for candidate in candidates:
-            if candidate.node.node_id == requested_id:
+        for node in nodes:
+            if node.node_id == requested_id:
                 return requested_id
-        if candidates:
-            listing = "\n".join(f"- {candidate.display_text}" for candidate in candidates)
+        if nodes:
+            listing = "\n".join(f"- {describe_node(node)}" for node in nodes)
             raise PipeWireRuntimeError(
                 f"Requested {label} node id {requested_id} is not active.\n"
                 f"Available {label} nodes:\n{listing}"
@@ -548,12 +320,12 @@ def _resolve_node_id(
         except re.error as exc:
             raise PipeWireRuntimeError(f"Invalid regex for {label} node match {pattern_text!r}: {exc}") from exc
 
-        matches = [candidate for candidate in candidates if pattern.search(candidate.match_text)]
+        matches = [node for node in nodes if pattern.search(describe_node(node))]
         if len(matches) == 1:
-            return matches[0].node.node_id
+            return matches[0].node_id
         if not matches:
-            if candidates:
-                listing = "\n".join(f"- {candidate.display_text}" for candidate in candidates)
+            if nodes:
+                listing = "\n".join(f"- {describe_node(node)}" for node in nodes)
                 raise PipeWireRuntimeError(
                     f"No {label} node matched the provided regex.\n"
                     f"Pattern: {pattern_text!r}\n"
@@ -562,22 +334,11 @@ def _resolve_node_id(
             raise PipeWireRuntimeError(
                 f"No {label} node matched the provided regex and no {label} nodes were found."
             )
-        listing = "\n".join(f"- {candidate.display_text}" for candidate in matches)
+        listing = "\n".join(f"- {describe_node(node)}" for node in matches)
         raise PipeWireRuntimeError(
             f"Multiple {label} nodes matched the provided regex; be more specific.\n"
             f"Pattern: {pattern_text!r}\n"
             f"Matches:\n{listing}"
-        )
-
-    stream_backed = [candidate for candidate in candidates if candidate.is_stream_backed]
-    if not interactive and len(stream_backed) == 1:
-        return stream_backed[0].node.node_id
-    if not interactive and len(stream_backed) > 1:
-        listing = "\n".join(f"- {candidate.display_text}" for candidate in stream_backed)
-        raise PipeWireRuntimeError(
-            f"Multiple active stream-backed {label} nodes were found; select one explicitly.\n"
-            f"{selector_help}\n"
-            f"Candidates:\n{listing}"
         )
 
     if not interactive:
@@ -586,12 +347,12 @@ def _resolve_node_id(
         )
 
     while True:
-        if candidates:
+        if nodes:
             print(f"sshg: select a PipeWire {label} node:", file=output_stream)
-            for offset, candidate in enumerate(candidates, start=1):
-                print(f"  {offset}. {candidate.display_text}", file=output_stream)
+            for offset, node in enumerate(nodes, start=1):
+                print(f"  {offset}. {describe_node(node)}", file=output_stream)
             print(
-                f"sshg: enter node number [1-{len(candidates)}] (or q to cancel): ",
+                f"sshg: enter node number [1-{len(nodes)}] (or q to cancel): ",
                 end="",
                 file=output_stream,
                 flush=True,
@@ -607,9 +368,9 @@ def _resolve_node_id(
             except ValueError:
                 print("sshg: invalid selection; enter a number.", file=output_stream)
                 continue
-            if 1 <= choice <= len(candidates):
-                return candidates[choice - 1].node.node_id
-            print(f"sshg: selection out of range; choose 1-{len(candidates)}.", file=output_stream)
+            if 1 <= choice <= len(nodes):
+                return nodes[choice - 1].node_id
+            print(f"sshg: selection out of range; choose 1-{len(nodes)}.", file=output_stream)
             continue
 
         print(
@@ -623,7 +384,7 @@ def _resolve_node_id(
             raise PipeWireRuntimeError(f"{label.title()} node selection cancelled (stdin closed).")
         if line.strip().lower() in {"q", "quit", "exit"}:
             raise PipeWireRuntimeError(f"{label.title()} node selection cancelled.")
-        candidates = candidate_provider()
+        nodes = list_capture_nodes() if label == "capture" else list_write_nodes()
 
 
 def resolve_client_capture_node_id(
@@ -635,7 +396,7 @@ def resolve_client_capture_node_id(
     output_stream: TextIO = sys.stderr,
 ) -> int:
     return _resolve_node_id(
-        candidate_provider=_capture_node_candidates,
+        nodes=list_capture_nodes(),
         requested_id=node_id,
         requested_match=node_match,
         interactive=interactive,
@@ -655,7 +416,7 @@ def resolve_client_write_node_id(
     output_stream: TextIO = sys.stderr,
 ) -> int:
     return _resolve_node_id(
-        candidate_provider=_write_node_candidates,
+        nodes=list_write_nodes(),
         requested_id=node_id,
         requested_match=node_match,
         interactive=interactive,
@@ -866,6 +627,9 @@ class PipeWireLinkAudioDuplexIO:
         self._playback: subprocess.Popen[bytes] | None = None
         self._rx_fd: int | None = None
         self._tx_fd: int | None = None
+        self._playback_fifo_dummy_rx_fd: int | None = None
+        self._capture_file_path: str | None = None
+        self._playback_fifo_path: str | None = None
         self._closed = False
 
         capture_node = _node_for_id(capture_node_id)
@@ -897,6 +661,8 @@ class PipeWireLinkAudioDuplexIO:
         self._playback_link_source_id: int | None = None
         self._playback_link_source_aliases: list[str] = ["pw-play"]
         self._known_node_ids = self._snapshot_node_ids()
+        self._capture_file_path = f"/tmp/{self._capture_node_name}.raw"
+        self._playback_fifo_path = f"/tmp/{self._playback_node_name}.raw.fifo"
 
         capture_env = os.environ.copy()
         capture_env["PIPEWIRE_PROPS"] = _build_pipewire_props(
@@ -908,6 +674,18 @@ class PipeWireLinkAudioDuplexIO:
             self._playback_node_name,
             "sshg_playback",
         )
+
+        if self._capture_file_path is None or self._playback_fifo_path is None:
+            raise PipeWireRuntimeError("Internal error: capture/playback paths were not initialized.")
+
+        self._touch_capture_file(self._capture_file_path)
+        self._create_fifo(self._playback_fifo_path, label="playback")
+        self._rx_fd = self._open_capture_file_for_read(self._capture_file_path)
+        self._playback_fifo_dummy_rx_fd = self._open_fifo_for_read(
+            self._playback_fifo_path,
+            label="playback bootstrap",
+        )
+        self._tx_fd = self._open_fifo_for_write(self._playback_fifo_path, label="playback")
 
         try:
             self._choose_routing_mode()
@@ -929,7 +707,7 @@ class PipeWireLinkAudioDuplexIO:
             "s16",
             "--latency",
             "30ms",
-            "-",
+            self._capture_file_path,
         ]
         playback_cmd = [
             pw_play_bin,
@@ -943,21 +721,21 @@ class PipeWireLinkAudioDuplexIO:
             "s16",
             "--latency",
             "30ms",
-            "-",
+            self._playback_fifo_path,
         ]
 
         try:
             self._capture = subprocess.Popen(
                 capture_cmd,
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 close_fds=True,
                 env=capture_env,
             )
             self._playback = subprocess.Popen(
                 playback_cmd,
-                stdin=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
                 close_fds=True,
@@ -975,12 +753,8 @@ class PipeWireLinkAudioDuplexIO:
                 raise PipeWireRuntimeError(_process_stderr(self._capture, "pw-record capture"))
             if self._playback.poll() is not None:
                 raise PipeWireRuntimeError(_process_stderr(self._playback, "pw-play playback"))
-            if self._capture.stdout is None or self._playback.stdin is None:
-                raise PipeWireRuntimeError("Failed to initialize pw-record/pw-play pipes.")
-            self._rx_fd = self._capture.stdout.fileno()
-            self._tx_fd = self._playback.stdin.fileno()
-            os.set_blocking(self._rx_fd, False)
-            os.set_blocking(self._tx_fd, False)
+
+            self._close_fd("_playback_fifo_dummy_rx_fd")
 
             self._wait_for_process_stability()
             if self._routing_mode == "explicit_link":
@@ -1069,13 +843,6 @@ class PipeWireLinkAudioDuplexIO:
         if "stream/output/audio" not in capture_media:
             return []
 
-        stream_sink_id = self._sink_for_playback_stream_node(self._capture_source_id)
-        if stream_sink_id is not None:
-            self._capture_target_id = stream_sink_id
-            return [
-                f"capture stream node {self._capture_source_id} maps to active sink node {stream_sink_id}"
-            ]
-
         sink_id = self._first_sink_node_id()
         if sink_id is None:
             return []
@@ -1161,9 +928,13 @@ class PipeWireLinkAudioDuplexIO:
         write_media = self._write_target_media_class.lower()
 
         if "stream/output/audio" in capture_media:
-            reasons.extend(self._retarget_capture_stream_for_direct_fallback())
-            if self._capture_target_id != self._capture_source_id:
-                sink_id = self._capture_target_id
+            sink_id = self._first_sink_node_id()
+            if sink_id is not None:
+                self._capture_target_id = sink_id
+                reasons.append(
+                    f"capture stream node {self._capture_source_id} has no exposed ports; "
+                    f"routing capture via sink node {sink_id}"
+                )
 
         if "stream/input/audio" in write_media:
             if sink_id is None:
@@ -1176,29 +947,6 @@ class PipeWireLinkAudioDuplexIO:
                 )
 
         return reasons
-
-    def _sink_for_playback_stream_node(self, node_id: int) -> int | None:
-        for stream in list_active_playback_streams():
-            if stream.node_id != node_id:
-                continue
-            sink_id = stream.sink_id
-            if sink_id is None:
-                continue
-            if self._is_sink_node_id(sink_id):
-                return sink_id
-        return None
-
-    def _is_sink_node_id(self, node_id: int) -> bool:
-        try:
-            nodes = list_nodes()
-        except PipeWireRuntimeError:
-            return False
-        for node in nodes:
-            if node.node_id != node_id:
-                continue
-            media_class = (node.media_class or "").strip().lower()
-            return media_class.startswith("audio/sink")
-        return False
 
     def _first_sink_node_id(self) -> int | None:
         try:
@@ -1221,6 +969,68 @@ class PipeWireLinkAudioDuplexIO:
             if _PORT_HEADER_RE.match(raw.strip()):
                 return True
         return False
+
+    def _create_fifo(self, path: str, *, label: str) -> None:
+        try:
+            os.mkfifo(path, 0o600)
+        except FileExistsError:
+            try:
+                os.unlink(path)
+                os.mkfifo(path, 0o600)
+            except Exception as exc:
+                raise PipeWireRuntimeError(
+                    f"Failed to recreate {label} FIFO path '{path}': {exc}"
+                ) from exc
+        except Exception as exc:
+            raise PipeWireRuntimeError(f"Failed to create {label} FIFO path '{path}': {exc}") from exc
+
+    def _touch_capture_file(self, path: str) -> None:
+        fd = None
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_RDWR, 0o600)
+        except Exception as exc:
+            raise PipeWireRuntimeError(f"Failed to create capture file path '{path}': {exc}") from exc
+        finally:
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def _open_capture_file_for_read(self, path: str) -> int:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except Exception as exc:
+            raise PipeWireRuntimeError(f"Failed to open capture file for read '{path}': {exc}") from exc
+        os.set_blocking(fd, False)
+        return fd
+
+    def _open_fifo_for_read(self, path: str, *, label: str) -> int:
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+        except Exception as exc:
+            raise PipeWireRuntimeError(f"Failed to open {label} FIFO for read '{path}': {exc}") from exc
+        os.set_blocking(fd, False)
+        return fd
+
+    def _open_fifo_for_write(self, path: str, *, label: str) -> int:
+        deadline = time.monotonic() + 1.0
+        last_error: OSError | None = None
+        while time.monotonic() < deadline:
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_NONBLOCK)
+                os.set_blocking(fd, False)
+                return fd
+            except OSError as exc:
+                if exc.errno in {errno.ENXIO, errno.ENOENT, errno.EINTR}:
+                    last_error = exc
+                    time.sleep(0.02)
+                    continue
+                raise PipeWireRuntimeError(f"Failed to open {label} FIFO for write '{path}': {exc}") from exc
+            except Exception as exc:
+                raise PipeWireRuntimeError(f"Failed to open {label} FIFO for write '{path}': {exc}") from exc
+        detail = f": {last_error}" if last_error is not None else ""
+        raise PipeWireRuntimeError(f"Timed out opening {label} FIFO for write '{path}'{detail}")
 
     def _close_fd(self, attr_name: str) -> None:
         fd = getattr(self, attr_name, None)
@@ -1340,7 +1150,7 @@ class PipeWireLinkAudioDuplexIO:
         if max_bytes < 1:
             return b""
         if self._rx_fd is None:
-            raise PipeWireRuntimeError("Capture pipe read fd is not initialized.")
+            raise PipeWireRuntimeError("Capture FIFO read fd is not initialized.")
 
         ready, _, _ = select.select([self._rx_fd], [], [], self.read_timeout)
         if not ready:
@@ -1360,7 +1170,7 @@ class PipeWireLinkAudioDuplexIO:
         if self._playback.poll() is not None:
             raise PipeWireRuntimeError(_process_stderr(self._playback, "pw-play playback"))
         if self._tx_fd is None:
-            raise PipeWireRuntimeError("Playback pipe write fd is not initialized.")
+            raise PipeWireRuntimeError("Playback FIFO write fd is not initialized.")
 
         if not self._playback_header_sent:
             self._write_to_playback(self._playback_stream_header)
@@ -1372,7 +1182,7 @@ class PipeWireLinkAudioDuplexIO:
         if not payload:
             return
         if self._tx_fd is None:
-            raise PipeWireRuntimeError("Playback pipe write fd is not initialized.")
+            raise PipeWireRuntimeError("Playback FIFO write fd is not initialized.")
 
         view = memoryview(payload)
         deadline = self.write_timeout
@@ -1425,3 +1235,16 @@ class PipeWireLinkAudioDuplexIO:
 
         self._close_fd("_rx_fd")
         self._close_fd("_tx_fd")
+        self._close_fd("_playback_fifo_dummy_rx_fd")
+
+        for path_attr in ("_capture_file_path", "_playback_fifo_path"):
+            path = getattr(self, path_attr, None)
+            if not path:
+                continue
+            try:
+                os.unlink(path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+            setattr(self, path_attr, None)
