@@ -214,6 +214,9 @@ sshg localhost \
   --transport audio-modem
 ```
 
+Interactive PipeWire selection now prioritizes live stream-backed candidates and includes
+runtime stream metadata (application/media names) in prompt entries.
+
 `sshg` now runs a PipeWire preflight before audio-modem startup and fails fast with remediation
 if no session manager / PipeWire ports are available. For advanced debugging only, this check
 can be bypassed with `--skip-pw-preflight`.
@@ -235,6 +238,10 @@ sshg localhost \
   --pw-capture-match 'chrome|firefox|spotify' \
   --pw-write-match 'pcoip|discord|teams'
 ```
+
+If exactly one stream-backed candidate is active, non-interactive runs auto-select it.
+If multiple stream-backed candidates are active, sshg exits with a candidate list and asks
+for `--pw-capture-*` / `--pw-write-*` selectors.
 
 Optional diagnostics:
 
