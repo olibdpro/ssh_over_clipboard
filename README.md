@@ -236,6 +236,20 @@ sshg localhost \
   --pw-write-match 'pcoip|discord|teams'
 ```
 
+To read inbound server audio-modem data from a WAV file path instead of selecting a
+PipeWire capture node, pass `--pw-capture-wav-path`:
+
+```bash
+sshg localhost \
+  --transport audio-modem \
+  --pw-capture-wav-path /tmp/inbound.wav \
+  --pw-write-node-id 77
+```
+
+When `--pw-capture-wav-path` is set, `sshg` skips client capture-node selection prompts.
+Write-node selection (`--pw-write-*`) still applies.
+WAV capture input accepts PCM16 mono/stereo; stereo input is downmixed to mono before modem decode.
+
 Optional diagnostics:
 
 ```bash
@@ -254,10 +268,18 @@ Troubleshooting:
 - Inspect server defaults/devices with `pactl info`, `pactl list short sources`, and `pactl list short sinks`.
 
 Useful reliability knobs:
-- `--audio-modulation` (`auto`, `robust-v1`, `legacy`; default `auto`)
+- `--audio-modulation` (`auto`, `robust-v1`, `pcoip-safe`, `legacy`; default `auto`)
 - `--audio-byte-repeat` (simple error-correction repeat factor, default `3`)
 - `--audio-ack-timeout-ms` / `--audio-max-retries`
 - `--audio-marker-run` (frame delimiter marker length)
+
+For lossy remoting audio paths (for example PCoIP OPUS/ADPCM), try:
+
+```bash
+sshg localhost \
+  --transport audio-modem \
+  --audio-modulation pcoip-safe
+```
 
 ## Protocol Notes
 

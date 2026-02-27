@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import binascii
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 import select
 import shutil
@@ -35,6 +35,7 @@ from .audio_modem_transport import AudioModemTransportBackend, AudioModemTranspo
 from .audio_pipewire_runtime import (
     PipeWireLinkAudioDuplexIO,
     PipeWireRuntimeError,
+    PipeWireWavCaptureAudioDuplexIO,
     ensure_client_pipewire_preflight,
     resolve_client_capture_node_id,
     resolve_client_write_node_id,
@@ -605,6 +606,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Do not apply raw termios settings to serial fd (debug/testing)",
     )
     parser.add_argument(
+        "--pw-capture-wav-path",
+        default=None,
+        help=(
+            "Path to a WAV file that sshg tails for inbound server response audio. "
+            "When set, sshg skips PipeWire capture-node selection."
+        ),
+    )
+    parser.add_argument(
         "--pw-capture-node-id",
         type=int,
         default=None,
@@ -694,7 +703,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--audio-modulation",
         default="auto",
-        choices=["auto", "legacy", "robust-v1"],
+        choices=["auto", "legacy", "robust-v1", "pcoip-safe"],
         help="Audio modulation profile for --transport audio-modem",
     )
     parser.add_argument(
@@ -775,10 +784,12 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
         )
 
     if args.transport == "audio-modem":
+        capture_wav_path = (args.pw_capture_wav_path or "").strip() or None
+
         if not args.skip_pw_preflight:
             try:
                 ensure_client_pipewire_preflight(
-                    capture_node_id=args.pw_capture_node_id,
+                    capture_node_id=None if capture_wav_path else args.pw_capture_node_id,
                     write_node_id=args.pw_write_node_id,
                 )
             except PipeWireRuntimeError as exc:
@@ -787,13 +798,15 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
                 print("[sshg] PipeWire preflight passed", file=sys.stderr)
 
         try:
-            capture_node_id = resolve_client_capture_node_id(
-                node_id=args.pw_capture_node_id,
-                node_match=args.pw_capture_match,
-                interactive=sys.stdin.isatty(),
-                input_stream=sys.stdin,
-                output_stream=sys.stderr,
-            )
+            capture_node_id: int | None = None
+            if capture_wav_path is None:
+                capture_node_id = resolve_client_capture_node_id(
+                    node_id=args.pw_capture_node_id,
+                    node_match=args.pw_capture_match,
+                    interactive=sys.stdin.isatty(),
+                    input_stream=sys.stdin,
+                    output_stream=sys.stderr,
+                )
             write_node_id = resolve_client_write_node_id(
                 node_id=args.pw_write_node_id,
                 node_match=args.pw_write_match,
@@ -805,31 +818,62 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
             raise TransportError(str(exc)) from exc
 
         if args.verbose:
-            print(f"[sshg] selected PipeWire capture node id={capture_node_id}", file=sys.stderr)
+            if capture_node_id is not None:
+                print(f"[sshg] selected PipeWire capture node id={capture_node_id}", file=sys.stderr)
+            else:
+                print(f"[sshg] using WAV tail capture path={capture_wav_path}", file=sys.stderr)
             print(f"[sshg] selected PipeWire write node id={write_node_id}", file=sys.stderr)
-            print(
-                "[sshg] using PipeWire link routing for client audio-modem I/O "
-                f"(capture-node={capture_node_id}, write-node={write_node_id})",
-                file=sys.stderr,
+            if capture_node_id is not None:
+                print(
+                    "[sshg] using PipeWire link routing for client audio-modem I/O "
+                    f"(capture-node={capture_node_id}, write-node={write_node_id})",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "[sshg] using WAV-path capture + PipeWire write routing for client audio-modem I/O "
+                    f"(capture-path={capture_wav_path}, write-node={write_node_id})",
+                    file=sys.stderr,
+                )
+
+        common_config = AudioModemTransportConfig(
+            input_device=(
+                f"pw-node:{capture_node_id}" if capture_node_id is not None else f"wav-path:{capture_wav_path}"
+            ),
+            output_device=f"pw-node:{write_node_id}",
+            sample_rate=max(args.audio_sample_rate, 8000),
+            read_timeout=max(args.audio_read_timeout_ms / 1000.0, 0.0),
+            write_timeout=max(args.audio_write_timeout_ms / 1000.0, 0.001),
+            frame_max_bytes=max(args.audio_frame_max_bytes, 1024),
+            ack_timeout=max(args.audio_ack_timeout_ms / 1000.0, 0.01),
+            max_retries=max(args.audio_max_retries, 1),
+            byte_repeat=max(args.audio_byte_repeat, 1),
+            marker_run=max(args.audio_marker_run, 4),
+            audio_modulation=args.audio_modulation,
+            audio_backend="pipewire-link",
+            verbose=args.verbose,
+        )
+        if capture_node_id is None:
+            assert capture_wav_path is not None
+            return AudioModemTransportBackend(
+                replace(
+                    common_config,
+                    io_factory=lambda config: PipeWireWavCaptureAudioDuplexIO(
+                        capture_wav_path=capture_wav_path,
+                        write_node_id=write_node_id,
+                        sample_rate=max(config.sample_rate, 8000),
+                        read_timeout=max(config.read_timeout, 0.0),
+                        write_timeout=max(config.write_timeout, 0.001),
+                    ),
+                )
             )
 
+        capture_node_id_final = capture_node_id
         return AudioModemTransportBackend(
-            AudioModemTransportConfig(
-                input_device=f"pw-node:{capture_node_id}",
-                output_device=f"pw-node:{write_node_id}",
-                sample_rate=max(args.audio_sample_rate, 8000),
-                read_timeout=max(args.audio_read_timeout_ms / 1000.0, 0.0),
-                write_timeout=max(args.audio_write_timeout_ms / 1000.0, 0.001),
-                frame_max_bytes=max(args.audio_frame_max_bytes, 1024),
-                ack_timeout=max(args.audio_ack_timeout_ms / 1000.0, 0.01),
-                max_retries=max(args.audio_max_retries, 1),
-                byte_repeat=max(args.audio_byte_repeat, 1),
-                marker_run=max(args.audio_marker_run, 4),
-                audio_modulation=args.audio_modulation,
-                audio_backend="pipewire-link",
-                verbose=args.verbose,
+            replace(
+                common_config,
                 io_factory=lambda config: PipeWireLinkAudioDuplexIO(
-                    capture_node_id=capture_node_id,
+                    capture_node_id=capture_node_id_final,
                     write_node_id=write_node_id,
                     sample_rate=max(config.sample_rate, 8000),
                     read_timeout=max(config.read_timeout, 0.0),

@@ -70,6 +70,17 @@ class AudioFrameCodecTests(unittest.TestCase):
         )
         self.assertIsInstance(codec, RobustFskFrameCodec)
 
+    def test_create_codec_pcoip_safe_uses_resilient_fsk_profile(self) -> None:
+        codec = create_audio_frame_codec(
+            modulation="pcoip-safe",
+            sample_rate=48000,
+            byte_repeat=3,
+            marker_run=16,
+        )
+        self.assertIsInstance(codec, RobustFskFrameCodec)
+        self.assertEqual(codec.symbol_rate, 900)
+        self.assertEqual(codec.bit_repeat, 5)
+
 
 if __name__ == "__main__":
     unittest.main()

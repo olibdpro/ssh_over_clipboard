@@ -1370,3 +1370,376 @@ class PipeWireLinkAudioDuplexIO:
             except OSError:
                 pass
             setattr(self, path_attr, None)
+
+
+class PipeWireWavCaptureAudioDuplexIO(PipeWireLinkAudioDuplexIO):
+    """Duplex PCM I/O using a tailed WAV path for capture and pw-play for playback."""
+
+    def __init__(
+        self,
+        *,
+        capture_wav_path: str,
+        write_node_id: int,
+        sample_rate: int,
+        read_timeout: float,
+        write_timeout: float,
+        pw_play_bin: str = "pw-play",
+    ) -> None:
+        self.read_timeout = max(read_timeout, 0.0)
+        self.write_timeout = max(write_timeout, 0.0)
+        self._linked_pairs: list[tuple[str, str]] = []
+        self._capture = None
+        self._capture_tail: subprocess.Popen[bytes] | None = None
+        self._playback: subprocess.Popen[bytes] | None = None
+        self._rx_fd: int | None = None
+        self._tx_fd: int | None = None
+        self._playback_fifo_dummy_rx_fd: int | None = None
+        self._capture_file_path = (capture_wav_path or "").strip()
+        self._playback_fifo_path: str | None = None
+        self._capture_header_buffer = bytearray()
+        self._capture_header_skipped = False
+        self._capture_wav_channels: int | None = None
+        self._capture_wav_sample_rate: int | None = None
+        self._capture_wav_bits_per_sample: int | None = None
+        self._capture_pcm_remainder = bytearray()
+        self._capture_expected_sample_rate = max(sample_rate, 1)
+        self._capture_wav_info_printed = False
+        self._closed = False
+
+        if not self._capture_file_path:
+            raise PipeWireRuntimeError("Capture WAV path cannot be empty.")
+
+        write_node = _node_for_id(write_node_id)
+        self._write_target_name = write_node.node_name
+        self._write_target_id = write_node_id
+        self._playback_target_id = write_node_id
+        self._playback_stream_header = _build_streaming_wav_header(
+            sample_rate=sample_rate,
+            channels=1,
+            bits_per_sample=16,
+        )
+        self._playback_header_sent = False
+
+        unique = f"{os.getpid()}_{int(time.monotonic() * 1000)}"
+        self._playback_node_name = f"sshg_playback_{unique}"
+        self._playback_fifo_path = f"/tmp/{self._playback_node_name}.raw.fifo"
+
+        playback_env = os.environ.copy()
+        playback_env["PIPEWIRE_PROPS"] = _build_pipewire_props(
+            self._playback_node_name,
+            "sshg_playback",
+        )
+
+        if self._playback_fifo_path is None:
+            raise PipeWireRuntimeError("Internal error: playback FIFO path was not initialized.")
+
+        self._create_fifo(self._playback_fifo_path, label="playback")
+        self._playback_fifo_dummy_rx_fd = self._open_fifo_for_read(
+            self._playback_fifo_path,
+            label="playback bootstrap",
+        )
+        self._tx_fd = self._open_fifo_for_write(self._playback_fifo_path, label="playback")
+
+        playback_cmd = [
+            pw_play_bin,
+            "--target",
+            str(self._playback_target_id),
+            "--rate",
+            str(sample_rate),
+            "--channels",
+            "1",
+            "--format",
+            "s16",
+            "--latency",
+            "30ms",
+            self._playback_fifo_path,
+        ]
+        capture_tail_cmd = [
+            "tail",
+            "-c",
+            "+1",
+            "-f",
+            self._capture_file_path,
+        ]
+
+        try:
+            self._playback = subprocess.Popen(
+                playback_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                close_fds=True,
+                env=playback_env,
+            )
+        except FileNotFoundError as exc:
+            self.close()
+            raise PipeWireRuntimeError("pw-play executable not found; install PipeWire CLI tools.") from exc
+        except Exception as exc:
+            self.close()
+            raise PipeWireRuntimeError(f"Failed to start pw-play pipeline: {exc}") from exc
+
+        try:
+            self._capture_tail = subprocess.Popen(
+                capture_tail_cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                close_fds=True,
+            )
+        except FileNotFoundError as exc:
+            self.close()
+            raise PipeWireRuntimeError(
+                "tail executable not found; install coreutils tail for WAV capture streaming."
+            ) from exc
+        except Exception as exc:
+            self.close()
+            raise PipeWireRuntimeError(f"Failed to start tail capture sidecar: {exc}") from exc
+
+        if self._capture_tail.stdout is None:
+            self.close()
+            raise PipeWireRuntimeError("Failed to initialize tail capture stream pipe.")
+        self._rx_fd = self._capture_tail.stdout.fileno()
+        os.set_blocking(self._rx_fd, False)
+
+        try:
+            self._wait_for_process_stability()
+            self._close_fd("_playback_fifo_dummy_rx_fd")
+        except Exception:
+            self.close()
+            raise
+
+    def _normalize_capture_chunk(self, chunk: bytes) -> bytes:
+        if not chunk:
+            return b""
+
+        if not self._capture_header_skipped:
+            self._capture_header_buffer.extend(chunk)
+            payload = self._consume_capture_wav_header_and_payload()
+            if payload is None:
+                return b""
+            return self._normalize_capture_pcm_payload(payload)
+
+        return self._normalize_capture_pcm_payload(chunk)
+
+    def _consume_capture_wav_header_and_payload(self) -> bytes | None:
+        buffered = self._capture_header_buffer
+        if len(buffered) < 12:
+            return None
+
+        if buffered[:4] != b"RIFF" or buffered[8:12] != b"WAVE":
+            raise PipeWireRuntimeError(
+                "Capture WAV stream does not start with a valid RIFF/WAVE header."
+            )
+
+        cursor = 12
+        fmt_found = False
+        while True:
+            if len(buffered) < cursor + 8:
+                return None
+
+            chunk_id = bytes(buffered[cursor : cursor + 4])
+            chunk_size = int.from_bytes(buffered[cursor + 4 : cursor + 8], "little")
+            payload_start = cursor + 8
+            payload_end = payload_start + chunk_size
+            padded_end = payload_end + (chunk_size & 1)
+            if chunk_id == b"data":
+                if not fmt_found:
+                    raise PipeWireRuntimeError("Capture WAV data chunk was found before fmt chunk.")
+                payload = bytes(buffered[payload_start:])
+                buffered.clear()
+                self._capture_header_skipped = True
+                self._log_capture_wav_format_once()
+                return payload
+
+            if len(buffered) < padded_end:
+                return None
+
+            if chunk_id == b"fmt ":
+                if chunk_size < 16:
+                    raise PipeWireRuntimeError(
+                        f"Capture WAV fmt chunk is too small ({chunk_size} bytes)."
+                    )
+                audio_format = int.from_bytes(buffered[payload_start : payload_start + 2], "little")
+                channels = int.from_bytes(buffered[payload_start + 2 : payload_start + 4], "little")
+                sample_rate = int.from_bytes(buffered[payload_start + 4 : payload_start + 8], "little")
+                bits_per_sample = int.from_bytes(buffered[payload_start + 14 : payload_start + 16], "little")
+
+                if audio_format != 1:
+                    raise PipeWireRuntimeError(
+                        f"Capture WAV format {audio_format} is unsupported (PCM format=1 required)."
+                    )
+                if channels not in {1, 2}:
+                    raise PipeWireRuntimeError(
+                        f"Capture WAV channel count {channels} is unsupported (expected mono or stereo)."
+                    )
+                if bits_per_sample != 16:
+                    raise PipeWireRuntimeError(
+                        "Capture WAV bits-per-sample "
+                        f"{bits_per_sample} is unsupported (16-bit PCM required)."
+                    )
+
+                self._capture_wav_channels = channels
+                self._capture_wav_sample_rate = sample_rate
+                self._capture_wav_bits_per_sample = bits_per_sample
+                fmt_found = True
+
+            cursor = padded_end
+
+    def _log_capture_wav_format_once(self) -> None:
+        if self._capture_wav_info_printed:
+            return
+        self._capture_wav_info_printed = True
+        channels = self._capture_wav_channels or 1
+        sample_rate = self._capture_wav_sample_rate or 0
+        conversion = "stereo->mono downmix" if channels == 2 else "mono passthrough"
+        print(
+            "[sshg] capture WAV format: "
+            f"channels={channels}, sample_rate={sample_rate}, bits=16, conversion={conversion}",
+            file=sys.stderr,
+        )
+        if sample_rate and sample_rate != self._capture_expected_sample_rate:
+            print(
+                "[sshg] warning: capture WAV sample rate "
+                f"{sample_rate} differs from --audio-sample-rate {self._capture_expected_sample_rate}; "
+                "decode quality may degrade.",
+                file=sys.stderr,
+            )
+
+    def _normalize_capture_pcm_payload(self, payload: bytes) -> bytes:
+        if not payload:
+            return b""
+
+        channels = self._capture_wav_channels or 1
+        frame_bytes = channels * 2
+        if frame_bytes < 2:
+            raise PipeWireRuntimeError("Invalid capture WAV frame geometry.")
+
+        if self._capture_pcm_remainder:
+            merged = bytearray(self._capture_pcm_remainder)
+            merged.extend(payload)
+            self._capture_pcm_remainder.clear()
+            payload = bytes(merged)
+
+        complete_len = (len(payload) // frame_bytes) * frame_bytes
+        if complete_len < len(payload):
+            self._capture_pcm_remainder.extend(payload[complete_len:])
+        if complete_len == 0:
+            return b""
+        payload = payload[:complete_len]
+
+        if channels == 1:
+            return payload
+
+        # Downmix interleaved stereo PCM16 to mono PCM16.
+        mono = bytearray()
+        for idx in range(0, len(payload), 4):
+            left = int.from_bytes(payload[idx : idx + 2], "little", signed=True)
+            right = int.from_bytes(payload[idx + 2 : idx + 4], "little", signed=True)
+            mixed = (left + right) // 2
+            mono.extend(int(mixed).to_bytes(2, "little", signed=True))
+        return bytes(mono)
+
+    def _wait_for_process_stability(self) -> None:
+        deadline = time.monotonic() + 0.2
+        while time.monotonic() < deadline:
+            if self._playback is None:
+                raise PipeWireRuntimeError("pw-play playback process failed to initialize")
+            if self._capture_tail is None:
+                raise PipeWireRuntimeError("tail capture process failed to initialize")
+            if self._playback.poll() is not None:
+                raise PipeWireRuntimeError(_process_stderr(self._playback, "pw-play playback"))
+            if self._capture_tail.poll() is not None:
+                raise PipeWireRuntimeError(_process_stderr(self._capture_tail, "tail capture stream"))
+            time.sleep(0.01)
+
+    def read(self, max_bytes: int) -> bytes:
+        if self._closed:
+            return b""
+        if self._playback is None:
+            raise PipeWireRuntimeError("pw-play playback process is not initialized.")
+        if self._capture_tail is None:
+            raise PipeWireRuntimeError("tail capture process is not initialized.")
+        if self._playback.poll() is not None:
+            raise PipeWireRuntimeError(_process_stderr(self._playback, "pw-play playback"))
+        if self._capture_tail.poll() is not None:
+            raise PipeWireRuntimeError(_process_stderr(self._capture_tail, "tail capture stream"))
+        if max_bytes < 1:
+            return b""
+        if self._rx_fd is None:
+            raise PipeWireRuntimeError("Capture read fd is not initialized.")
+
+        ready, _, _ = select.select([self._rx_fd], [], [], self.read_timeout)
+        if not ready:
+            return b""
+        try:
+            chunk = os.read(self._rx_fd, max_bytes)
+            if not chunk:
+                return b""
+            return self._normalize_capture_chunk(chunk)
+        except BlockingIOError:
+            return b""
+        except OSError as exc:
+            if exc.errno in {errno.EAGAIN, errno.EWOULDBLOCK}:
+                return b""
+            raise PipeWireRuntimeError(f"tail capture read failed: {exc}") from exc
+
+    def write(self, data: bytes) -> None:
+        if self._closed or not data:
+            return
+        if self._playback is None:
+            raise PipeWireRuntimeError("pw-play playback process is not initialized.")
+        if self._playback.poll() is not None:
+            raise PipeWireRuntimeError(_process_stderr(self._playback, "pw-play playback"))
+        if self._tx_fd is None:
+            raise PipeWireRuntimeError("Playback FIFO write fd is not initialized.")
+
+        if not self._playback_header_sent:
+            self._write_to_playback(self._playback_stream_header)
+            self._playback_header_sent = True
+
+        self._write_to_playback(data)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+
+        for proc, close_stdin in (
+            (getattr(self, "_playback", None), True),
+            (getattr(self, "_capture_tail", None), False),
+        ):
+            if proc is None:
+                continue
+            try:
+                if close_stdin and proc.stdin is not None:
+                    proc.stdin.close()
+            except OSError:
+                pass
+            try:
+                if proc.stdout is not None:
+                    close_stdout = getattr(proc.stdout, "close", None)
+                    if callable(close_stdout):
+                        close_stdout()
+            except OSError:
+                pass
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=1.0)
+
+        self._close_fd("_rx_fd")
+        self._close_fd("_tx_fd")
+        self._close_fd("_playback_fifo_dummy_rx_fd")
+
+        playback_fifo = getattr(self, "_playback_fifo_path", None)
+        if playback_fifo:
+            try:
+                os.unlink(playback_fifo)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+            self._playback_fifo_path = None

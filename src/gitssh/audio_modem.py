@@ -11,8 +11,14 @@ import zlib
 
 MODULATION_LEGACY = "legacy"
 MODULATION_ROBUST_V1 = "robust-v1"
+MODULATION_PCOIP_SAFE = "pcoip-safe"
 MODULATION_AUTO = "auto"
-SUPPORTED_AUDIO_MODULATIONS = (MODULATION_LEGACY, MODULATION_ROBUST_V1, MODULATION_AUTO)
+SUPPORTED_AUDIO_MODULATIONS = (
+    MODULATION_LEGACY,
+    MODULATION_ROBUST_V1,
+    MODULATION_PCOIP_SAFE,
+    MODULATION_AUTO,
+)
 
 
 class AudioCodecError(RuntimeError):
@@ -42,7 +48,7 @@ def normalize_audio_modulation(value: str | None, *, allow_auto: bool = True) ->
         if allow_auto:
             return MODULATION_AUTO
         return MODULATION_LEGACY
-    if cleaned in {MODULATION_LEGACY, MODULATION_ROBUST_V1}:
+    if cleaned in {MODULATION_LEGACY, MODULATION_ROBUST_V1, MODULATION_PCOIP_SAFE}:
         return cleaned
     raise AudioCodecError(
         f"Unsupported audio modulation '{value}'. "
@@ -70,6 +76,16 @@ def create_audio_frame_codec(
 
     if effective == MODULATION_ROBUST_V1:
         return RobustFskFrameCodec(sample_rate=max(sample_rate, 8000))
+
+    if effective == MODULATION_PCOIP_SAFE:
+        # PCoIP voice channels commonly apply lossy coding and dynamic bandwidth shaping.
+        # Trade throughput for resilience while keeping interactive setup latency practical.
+        return RobustFskFrameCodec(
+            sample_rate=max(sample_rate, 8000),
+            symbol_rate=900,
+            bit_repeat=5,
+            amplitude=13000,
+        )
 
     # Should never happen due normalization guard.
     raise AudioCodecError(f"Unsupported normalized audio modulation '{effective}'")

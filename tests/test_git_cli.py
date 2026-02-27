@@ -26,6 +26,7 @@ class GitClientCliTests(unittest.TestCase):
         self.assertEqual(args.serial_baud, 3000000)
         self.assertIsNone(args.pw_capture_node_id)
         self.assertIsNone(args.pw_capture_match)
+        self.assertIsNone(args.pw_capture_wav_path)
         self.assertIsNone(args.pw_write_node_id)
         self.assertIsNone(args.pw_write_match)
         self.assertFalse(args.skip_pw_preflight)
@@ -60,6 +61,8 @@ class GitClientCliTests(unittest.TestCase):
                 "77",
                 "--pw-capture-match",
                 "chrome|firefox",
+                "--pw-capture-wav-path",
+                "/tmp/inbound.wav",
                 "--pw-write-node-id",
                 "88",
                 "--pw-write-match",
@@ -69,17 +72,18 @@ class GitClientCliTests(unittest.TestCase):
                 "--audio-byte-repeat",
                 "5",
                 "--audio-modulation",
-                "robust-v1",
+                "pcoip-safe",
             ]
         )
         self.assertEqual(args.transport, "audio-modem")
         self.assertEqual(args.pw_capture_node_id, 77)
         self.assertEqual(args.pw_capture_match, "chrome|firefox")
+        self.assertEqual(args.pw_capture_wav_path, "/tmp/inbound.wav")
         self.assertEqual(args.pw_write_node_id, 88)
         self.assertEqual(args.pw_write_match, "pcoip-record-stream")
         self.assertEqual(args.audio_sample_rate, 44100)
         self.assertEqual(args.audio_byte_repeat, 5)
-        self.assertEqual(args.audio_modulation, "robust-v1")
+        self.assertEqual(args.audio_modulation, "pcoip-safe")
 
     def test_audio_modem_rejects_legacy_backend_flag(self) -> None:
         with self.assertRaises(SystemExit):
@@ -132,6 +136,35 @@ class GitClientCliTests(unittest.TestCase):
         preflight.assert_called_once_with(capture_node_id=11, write_node_id=22)
         resolve_capture.assert_called_once()
         resolve_write.assert_called_once()
+        backend.close()
+
+    def test_audio_modem_backend_build_with_pcoip_safe_modulation(self) -> None:
+        args = build_client_parser().parse_args(
+            [
+                "localhost",
+                "--transport",
+                "audio-modem",
+                "--pw-capture-node-id",
+                "11",
+                "--pw-write-node-id",
+                "22",
+                "--audio-modulation",
+                "pcoip-safe",
+            ]
+        )
+
+        with (
+            mock.patch("gitssh.client.ensure_client_pipewire_preflight") as preflight,
+            mock.patch("gitssh.client.resolve_client_capture_node_id", return_value=11),
+            mock.patch("gitssh.client.resolve_client_write_node_id", return_value=22),
+        ):
+            backend = build_client_backend(args)
+
+        self.assertEqual(
+            backend.name(),
+            "audio-modem:pipewire-link:pcoip-safe:in=pw-node:11,out=pw-node:22",
+        )
+        preflight.assert_called_once_with(capture_node_id=11, write_node_id=22)
         backend.close()
 
     def test_audio_modem_propagates_pipewire_selection_errors(self) -> None:
@@ -188,6 +221,35 @@ class GitClientCliTests(unittest.TestCase):
         ):
             backend = build_client_backend(args)
         preflight.assert_not_called()
+        backend.close()
+
+    def test_audio_modem_wav_capture_path_skips_capture_selection(self) -> None:
+        args = build_client_parser().parse_args(
+            [
+                "localhost",
+                "--transport",
+                "audio-modem",
+                "--pw-capture-wav-path",
+                "/tmp/inbound.wav",
+                "--pw-write-node-id",
+                "22",
+            ]
+        )
+
+        with (
+            mock.patch("gitssh.client.ensure_client_pipewire_preflight") as preflight,
+            mock.patch("gitssh.client.resolve_client_capture_node_id") as resolve_capture,
+            mock.patch("gitssh.client.resolve_client_write_node_id", return_value=22) as resolve_write,
+        ):
+            backend = build_client_backend(args)
+
+        self.assertEqual(
+            backend.name(),
+            "audio-modem:pipewire-link:robust-v1:in=wav-path:/tmp/inbound.wav,out=pw-node:22",
+        )
+        preflight.assert_called_once_with(capture_node_id=None, write_node_id=22)
+        resolve_capture.assert_not_called()
+        resolve_write.assert_called_once()
         backend.close()
 
     def test_supports_google_drive_transport_options(self) -> None:
@@ -265,12 +327,12 @@ class GitServerCliTests(unittest.TestCase):
                 "--audio-marker-run",
                 "24",
                 "--audio-modulation",
-                "legacy",
+                "pcoip-safe",
             ]
         )
         self.assertEqual(args.transport, "audio-modem")
         self.assertEqual(args.audio_marker_run, 24)
-        self.assertEqual(args.audio_modulation, "legacy")
+        self.assertEqual(args.audio_modulation, "pcoip-safe")
 
     def test_supports_diag_options(self) -> None:
         args = build_server_parser().parse_args(

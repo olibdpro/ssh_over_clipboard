@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import pathlib
+import struct
 import sys
 import unittest
 from unittest import mock
@@ -16,6 +17,7 @@ from gitssh.audio_pipewire_runtime import (  # noqa: E402
     PipeWireNode,
     PipeWirePreflightReport,
     PipeWireRuntimeError,
+    PipeWireWavCaptureAudioDuplexIO,
     _ports_for_node,
     build_client_pipewire_preflight_report,
     describe_node,
@@ -842,6 +844,276 @@ class PipeWireRuntimeTests(unittest.TestCase):
         ):
             io_obj = PipeWireLinkAudioDuplexIO(
                 capture_node_id=49,
+                write_node_id=44,
+                sample_rate=48000,
+                read_timeout=0.01,
+                write_timeout=0.05,
+            )
+            io_obj.write(b"\x01\x02\x03\x04")
+            io_obj.write(b"\x05\x06")
+            io_obj.close()
+
+        self.assertGreaterEqual(len(writes), 3)
+        self.assertEqual(writes[0][:4], b"RIFF")
+        self.assertEqual(writes[0][8:12], b"WAVE")
+        self.assertEqual(writes[1], b"\x01\x02\x03\x04")
+        self.assertEqual(writes[2], b"\x05\x06")
+
+    def test_wav_capture_duplex_uses_tail_and_pw_play(self) -> None:
+        nodes = [PipeWireNode(44, "write.node", "write", "app", "Stream/Input/Audio")]
+        playback_proc = _FakeProc()
+        tail_proc = _FakeProc(stdout_fd=201)
+
+        with (
+            mock.patch("gitssh.audio_pipewire_runtime.list_nodes", return_value=nodes),
+            mock.patch("gitssh.audio_pipewire_runtime.os.mkfifo") as mkfifo,
+            mock.patch("gitssh.audio_pipewire_runtime.os.open", side_effect=[100, 101]),
+            mock.patch("gitssh.audio_pipewire_runtime.os.set_blocking"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.close"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.unlink") as unlink,
+            mock.patch(
+                "gitssh.audio_pipewire_runtime.subprocess.Popen",
+                side_effect=[playback_proc, tail_proc],
+            ) as popen,
+        ):
+            io_obj = PipeWireWavCaptureAudioDuplexIO(
+                capture_wav_path="/tmp/inbound.wav",
+                write_node_id=44,
+                sample_rate=48000,
+                read_timeout=0.01,
+                write_timeout=0.05,
+            )
+            playback_fifo = io_obj._playback_fifo_path
+            io_obj.close()
+
+        self.assertIsNotNone(playback_fifo)
+        mkfifo.assert_any_call(playback_fifo, 0o600)
+
+        playback_cmd = popen.call_args_list[0].args[0]
+        tail_cmd = popen.call_args_list[1].args[0]
+        self.assertEqual(playback_cmd[0], "pw-play")
+        self.assertEqual(tail_cmd, ["tail", "-c", "+1", "-f", "/tmp/inbound.wav"])
+        self.assertEqual(playback_cmd[playback_cmd.index("--target") + 1], "44")
+        self.assertEqual(playback_cmd[-1], playback_fifo)
+
+        unlinked_paths = [call.args[0] for call in unlink.call_args_list]
+        self.assertIn(playback_fifo, unlinked_paths)
+        self.assertNotIn("/tmp/inbound.wav", unlinked_paths)
+
+    def test_wav_capture_duplex_read_returns_stream_data_when_ready(self) -> None:
+        nodes = [PipeWireNode(44, "write.node", "write", "app", "Stream/Input/Audio")]
+        playback_proc = _FakeProc()
+        tail_proc = _FakeProc(stdout_fd=201)
+        wav_header = (
+            b"RIFF"
+            + struct.pack("<I", 0x7FFFFFFF)
+            + b"WAVEfmt "
+            + struct.pack("<IHHIIHH", 16, 1, 1, 48000, 96000, 2, 16)
+            + b"data"
+            + struct.pack("<I", 0x7FFFFFFF)
+        )
+
+        with (
+            mock.patch("gitssh.audio_pipewire_runtime.list_nodes", return_value=nodes),
+            mock.patch("gitssh.audio_pipewire_runtime.os.mkfifo"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.open", side_effect=[100, 101]),
+            mock.patch("gitssh.audio_pipewire_runtime.os.set_blocking"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.close"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.unlink"),
+            mock.patch(
+                "gitssh.audio_pipewire_runtime.subprocess.Popen",
+                side_effect=[playback_proc, tail_proc],
+            ),
+            mock.patch("gitssh.audio_pipewire_runtime.select.select", return_value=([201], [], [])),
+            mock.patch("gitssh.audio_pipewire_runtime.os.read", return_value=wav_header + b"\x01\x02\x03\x04"),
+        ):
+            io_obj = PipeWireWavCaptureAudioDuplexIO(
+                capture_wav_path="/tmp/inbound.wav",
+                write_node_id=44,
+                sample_rate=48000,
+                read_timeout=0.01,
+                write_timeout=0.05,
+            )
+            self.assertEqual(io_obj.read(4096), b"\x01\x02\x03\x04")
+            io_obj.close()
+
+    def test_wav_capture_duplex_downmixes_stereo_to_mono(self) -> None:
+        nodes = [PipeWireNode(44, "write.node", "write", "app", "Stream/Input/Audio")]
+        playback_proc = _FakeProc()
+        tail_proc = _FakeProc(stdout_fd=201)
+        wav_header = (
+            b"RIFF"
+            + struct.pack("<I", 0x7FFFFFFF)
+            + b"WAVEfmt "
+            + struct.pack("<IHHIIHH", 16, 1, 2, 48000, 192000, 4, 16)
+            + b"data"
+            + struct.pack("<I", 0x7FFFFFFF)
+        )
+        stereo_payload = struct.pack("<hhhh", 1000, -1000, 2000, 2000)
+        expected_mono = struct.pack("<hh", 0, 2000)
+
+        with (
+            mock.patch("gitssh.audio_pipewire_runtime.list_nodes", return_value=nodes),
+            mock.patch("gitssh.audio_pipewire_runtime.os.mkfifo"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.open", side_effect=[100, 101]),
+            mock.patch("gitssh.audio_pipewire_runtime.os.set_blocking"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.close"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.unlink"),
+            mock.patch(
+                "gitssh.audio_pipewire_runtime.subprocess.Popen",
+                side_effect=[playback_proc, tail_proc],
+            ),
+            mock.patch("gitssh.audio_pipewire_runtime.select.select", return_value=([201], [], [])),
+            mock.patch("gitssh.audio_pipewire_runtime.os.read", return_value=wav_header + stereo_payload),
+        ):
+            io_obj = PipeWireWavCaptureAudioDuplexIO(
+                capture_wav_path="/tmp/inbound.wav",
+                write_node_id=44,
+                sample_rate=48000,
+                read_timeout=0.01,
+                write_timeout=0.05,
+            )
+            self.assertEqual(io_obj.read(4096), expected_mono)
+            io_obj.close()
+
+    def test_wav_capture_duplex_handles_header_split_across_reads(self) -> None:
+        nodes = [PipeWireNode(44, "write.node", "write", "app", "Stream/Input/Audio")]
+        playback_proc = _FakeProc()
+        tail_proc = _FakeProc(stdout_fd=201)
+        wav_header = (
+            b"RIFF"
+            + struct.pack("<I", 0x7FFFFFFF)
+            + b"WAVEfmt "
+            + struct.pack("<IHHIIHH", 16, 1, 1, 48000, 96000, 2, 16)
+            + b"data"
+            + struct.pack("<I", 0x7FFFFFFF)
+        )
+        part_a = wav_header[:10]
+        part_b = wav_header[10:] + b"\x11\x22"
+
+        with (
+            mock.patch("gitssh.audio_pipewire_runtime.list_nodes", return_value=nodes),
+            mock.patch("gitssh.audio_pipewire_runtime.os.mkfifo"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.open", side_effect=[100, 101]),
+            mock.patch("gitssh.audio_pipewire_runtime.os.set_blocking"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.close"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.unlink"),
+            mock.patch(
+                "gitssh.audio_pipewire_runtime.subprocess.Popen",
+                side_effect=[playback_proc, tail_proc],
+            ),
+            mock.patch(
+                "gitssh.audio_pipewire_runtime.select.select",
+                side_effect=[([201], [], []), ([201], [], [])],
+            ),
+            mock.patch("gitssh.audio_pipewire_runtime.os.read", side_effect=[part_a, part_b]),
+        ):
+            io_obj = PipeWireWavCaptureAudioDuplexIO(
+                capture_wav_path="/tmp/inbound.wav",
+                write_node_id=44,
+                sample_rate=48000,
+                read_timeout=0.01,
+                write_timeout=0.05,
+            )
+            self.assertEqual(io_obj.read(4096), b"")
+            self.assertEqual(io_obj.read(4096), b"\x11\x22")
+            io_obj.close()
+
+    def test_wav_capture_duplex_rejects_non_wave_stream(self) -> None:
+        nodes = [PipeWireNode(44, "write.node", "write", "app", "Stream/Input/Audio")]
+        playback_proc = _FakeProc()
+        tail_proc = _FakeProc(stdout_fd=201)
+
+        with (
+            mock.patch("gitssh.audio_pipewire_runtime.list_nodes", return_value=nodes),
+            mock.patch("gitssh.audio_pipewire_runtime.os.mkfifo"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.open", side_effect=[100, 101]),
+            mock.patch("gitssh.audio_pipewire_runtime.os.set_blocking"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.close"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.unlink"),
+            mock.patch(
+                "gitssh.audio_pipewire_runtime.subprocess.Popen",
+                side_effect=[playback_proc, tail_proc],
+            ),
+            mock.patch("gitssh.audio_pipewire_runtime.select.select", return_value=([201], [], [])),
+            mock.patch("gitssh.audio_pipewire_runtime.os.read", return_value=b"NOTWAVEHEADERDATA"),
+        ):
+            io_obj = PipeWireWavCaptureAudioDuplexIO(
+                capture_wav_path="/tmp/inbound.wav",
+                write_node_id=44,
+                sample_rate=48000,
+                read_timeout=0.01,
+                write_timeout=0.05,
+            )
+            with self.assertRaises(PipeWireRuntimeError):
+                io_obj.read(4096)
+            io_obj.close()
+
+    def test_wav_capture_duplex_rejects_unsupported_bit_depth(self) -> None:
+        nodes = [PipeWireNode(44, "write.node", "write", "app", "Stream/Input/Audio")]
+        playback_proc = _FakeProc()
+        tail_proc = _FakeProc(stdout_fd=201)
+        wav_header = (
+            b"RIFF"
+            + struct.pack("<I", 0x7FFFFFFF)
+            + b"WAVEfmt "
+            + struct.pack("<IHHIIHH", 16, 1, 1, 48000, 144000, 3, 24)
+            + b"data"
+            + struct.pack("<I", 0x7FFFFFFF)
+        )
+
+        with (
+            mock.patch("gitssh.audio_pipewire_runtime.list_nodes", return_value=nodes),
+            mock.patch("gitssh.audio_pipewire_runtime.os.mkfifo"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.open", side_effect=[100, 101]),
+            mock.patch("gitssh.audio_pipewire_runtime.os.set_blocking"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.close"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.unlink"),
+            mock.patch(
+                "gitssh.audio_pipewire_runtime.subprocess.Popen",
+                side_effect=[playback_proc, tail_proc],
+            ),
+            mock.patch("gitssh.audio_pipewire_runtime.select.select", return_value=([201], [], [])),
+            mock.patch("gitssh.audio_pipewire_runtime.os.read", return_value=wav_header + b"\x00\x00\x00"),
+        ):
+            io_obj = PipeWireWavCaptureAudioDuplexIO(
+                capture_wav_path="/tmp/inbound.wav",
+                write_node_id=44,
+                sample_rate=48000,
+                read_timeout=0.01,
+                write_timeout=0.05,
+            )
+            with self.assertRaises(PipeWireRuntimeError):
+                io_obj.read(4096)
+            io_obj.close()
+
+    def test_wav_capture_duplex_write_prepends_wav_header_once(self) -> None:
+        nodes = [PipeWireNode(44, "write.node", "write", "app", "Stream/Input/Audio")]
+        playback_proc = _FakeProc()
+        tail_proc = _FakeProc(stdout_fd=201)
+        writes: list[bytes] = []
+
+        def _fake_write(_fd: int, chunk: bytes | memoryview) -> int:
+            blob = bytes(chunk)
+            writes.append(blob)
+            return len(blob)
+
+        with (
+            mock.patch("gitssh.audio_pipewire_runtime.list_nodes", return_value=nodes),
+            mock.patch("gitssh.audio_pipewire_runtime.os.mkfifo"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.open", side_effect=[100, 101]),
+            mock.patch("gitssh.audio_pipewire_runtime.os.set_blocking"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.close"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.unlink"),
+            mock.patch(
+                "gitssh.audio_pipewire_runtime.subprocess.Popen",
+                side_effect=[playback_proc, tail_proc],
+            ),
+            mock.patch("gitssh.audio_pipewire_runtime.select.select", return_value=([], [101], [])),
+            mock.patch("gitssh.audio_pipewire_runtime.os.write", side_effect=_fake_write),
+        ):
+            io_obj = PipeWireWavCaptureAudioDuplexIO(
+                capture_wav_path="/tmp/inbound.wav",
                 write_node_id=44,
                 sample_rate=48000,
                 read_timeout=0.01,
