@@ -80,11 +80,16 @@ def create_audio_frame_codec(
     if effective == MODULATION_PCOIP_SAFE:
         # PCoIP voice channels commonly apply lossy coding and dynamic bandwidth shaping.
         # Trade throughput for resilience while keeping interactive setup latency practical.
+        # Use low-frequency tone set (600–1800 Hz) to avoid PCoIP high-freq attenuation.
+        # Stereo doubles the Goertzel SNR budget (L+R independent ADPCM noise), so
+        # bit_repeat can drop from 5→3, recovering ~1.67× throughput.
         return RobustFskFrameCodec(
             sample_rate=max(sample_rate, 8000),
             symbol_rate=900,
-            bit_repeat=5,
+            bit_repeat=3,
             amplitude=13000,
+            freqs=(600.0, 900.0, 1200.0, 1800.0),
+            channels=2,
         )
 
     # Should never happen due normalization guard.
@@ -291,19 +296,29 @@ class RobustFskFrameCodec:
         symbol_rate: int = 1200,
         bit_repeat: int = 3,
         amplitude: int = 9000,
+        freqs: tuple[float, float, float, float] | None = None,
+        channels: int = 1,
     ) -> None:
         self.sample_rate = max(sample_rate, 8000)
         self.symbol_rate = max(symbol_rate, 100)
         self.samples_per_symbol = max(int(round(self.sample_rate / float(self.symbol_rate))), 8)
         self.bit_repeat = max(bit_repeat, 1)
         self.amplitude = max(min(amplitude, 20000), 1000)
+        self.channels = max(channels, 1)
+
+        if freqs is not None:
+            if len(freqs) != 4 or any(f <= 0 for f in freqs):
+                raise AudioCodecError("freqs must be a tuple of exactly 4 positive floats.")
+            self._freqs: tuple[float, ...] = tuple(float(f) for f in freqs)
+        else:
+            self._freqs = self._FREQS
 
         self._phase = 0.0
         self._sample_buffer = bytearray()
         self._symbol_buffer: list[int] = []
 
-        self._symbol_bytes = self.samples_per_symbol * 2
-        self._steps = tuple((2.0 * math.pi * freq) / float(self.sample_rate) for freq in self._FREQS)
+        self._symbol_bytes = self.samples_per_symbol * 2 * self.channels
+        self._steps = tuple((2.0 * math.pi * freq) / float(self.sample_rate) for freq in self._freqs)
         self._goertzel_coeffs = tuple(2.0 * math.cos(step) for step in self._steps)
 
         preamble_base = [0, 3] * 32
@@ -397,7 +412,9 @@ class RobustFskFrameCodec:
         for symbol in symbols:
             step = self._steps[int(symbol) & 0x3]
             for _ in range(self.samples_per_symbol):
-                samples.append(int(self.amplitude * math.sin(phase)))
+                s = int(self.amplitude * math.sin(phase))
+                for _ch in range(self.channels):
+                    samples.append(s)
                 phase += step
                 if phase >= 2.0 * math.pi:
                     phase -= 2.0 * math.pi
@@ -420,7 +437,10 @@ class RobustFskFrameCodec:
         best_idx = 0
         best_power = float("-inf")
         for idx, coeff in enumerate(self._goertzel_coeffs):
-            power = _goertzel_power(samples, coeff)
+            power = sum(
+                _goertzel_power(samples[ch :: self.channels], coeff)
+                for ch in range(self.channels)
+            )
             if power > best_power:
                 best_power = power
                 best_idx = idx
