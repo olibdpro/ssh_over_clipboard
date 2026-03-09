@@ -1263,5 +1263,224 @@ class PipeWireRuntimeTests(unittest.TestCase):
         self.assertIn("no visible Port objects", str(ctx.exception))
 
 
+class WavCaptureModemDecodeIntegrationTests(unittest.TestCase):
+    """Integration tests for the WAV-capture → FSK-decode pipeline.
+
+    These tests exercise the full path that the client uses when reading a
+    server ack through PipeWireWavCaptureAudioDuplexIO:
+      pw-record (or tail of captured file) → WAV header strip → raw PCM
+      → RobustFskFrameCodec.feed_pcm() → decoded frame
+
+    The in.wav fixture at the project root contains a real recording of the
+    server ack audio captured during session f6b1d681-8040-416c-91ab-60acdd0e3ad4.
+    Analysis shows the PCoIP audio path severely attenuates the 3000 Hz FSK
+    tone used by the preamble, which causes standard robust-v1 decode to fail.
+    The roundtrip test below uses freshly encoded audio to prove the pipeline
+    works when audio is not degraded.
+    """
+
+    _ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+    def _build_mono_wav(self, pcm_bytes: bytes, sample_rate: int = 48000) -> bytes:
+        """Wrap raw s16le mono PCM in a valid WAV container."""
+        return (
+            b"RIFF"
+            + struct.pack("<I", 36 + len(pcm_bytes))
+            + b"WAVEfmt "
+            + struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16)
+            + b"data"
+            + struct.pack("<I", len(pcm_bytes))
+            + pcm_bytes
+        )
+
+    def _make_wav_io(
+        self,
+        wav_bytes: bytes,
+        chunk_size: int = 4096,
+    ) -> PipeWireWavCaptureAudioDuplexIO:
+        """Stand up a PipeWireWavCaptureAudioDuplexIO backed by in-memory WAV data.
+
+        Subprocesses and OS calls are mocked; the 0.2 s _wait_for_process_stability
+        sleep is short-circuited via a time.sleep mock.
+        """
+        nodes = [PipeWireNode(44, "write.node", "write", "app", "Stream/Input/Audio")]
+        playback_proc = _FakeProc()
+        tail_proc = _FakeProc(stdout_fd=201)
+
+        chunks = [wav_bytes[i : i + chunk_size] for i in range(0, len(wav_bytes), chunk_size)]
+        chunk_iter = iter(chunks)
+        exhausted = [False]
+
+        def _fake_select(rlist, _w, _x, timeout=None):
+            return ([], [], []) if exhausted[0] else ([201], [], [])
+
+        def _fake_os_read(_fd, _n):
+            try:
+                return next(chunk_iter)
+            except StopIteration:
+                exhausted[0] = True
+                raise BlockingIOError("no more data")
+
+        patches = [
+            mock.patch("gitssh.audio_pipewire_runtime.list_nodes", return_value=nodes),
+            mock.patch("gitssh.audio_pipewire_runtime.os.mkfifo"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.open", side_effect=[100, 101]),
+            mock.patch("gitssh.audio_pipewire_runtime.os.set_blocking"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.close"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.unlink"),
+            mock.patch(
+                "gitssh.audio_pipewire_runtime.subprocess.Popen",
+                side_effect=[playback_proc, tail_proc],
+            ),
+            mock.patch("gitssh.audio_pipewire_runtime.select.select", side_effect=_fake_select),
+            mock.patch("gitssh.audio_pipewire_runtime.os.read", side_effect=_fake_os_read),
+            mock.patch("gitssh.audio_pipewire_runtime.time.sleep"),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+        return PipeWireWavCaptureAudioDuplexIO(
+            capture_wav_path="/tmp/server_ack.wav",
+            write_node_id=44,
+            sample_rate=48000,
+            read_timeout=0.01,
+            write_timeout=0.05,
+        )
+
+    def _drain_pcm(self, io_obj: PipeWireWavCaptureAudioDuplexIO, max_reads: int = 1024) -> bytes:
+        buf = bytearray()
+        for _ in range(max_reads):
+            chunk = io_obj.read(65536)
+            if not chunk:
+                break
+            buf.extend(chunk)
+        return bytes(buf)
+
+    # ------------------------------------------------------------------
+    # Roundtrip: encode → WAV → WavCaptureIO → decode
+    # ------------------------------------------------------------------
+
+    def test_roundtrip_encode_decode_via_wav_capture(self) -> None:
+        """Encode a frame, wrap in WAV, stream through WavCaptureIO, recover frame.
+
+        This is the canonical proof that the capture decode pipeline works
+        end-to-end when audio quality is not degraded.
+        """
+        from gitssh.audio_modem import RobustFskFrameCodec
+
+        sample_rate = 48000
+        # Realistic connect_ack link-frame payload (AUDM magic + type byte + session UUID bytes)
+        payload = b"AUDM\x01\x02" + b"f6b1d681804041c691ab60acdd0e3ad4"
+
+        encoder = RobustFskFrameCodec(sample_rate=sample_rate)
+        pcm_bytes = encoder.encode_frame(payload)
+
+        wav_bytes = self._build_mono_wav(pcm_bytes, sample_rate=sample_rate)
+
+        io_obj = self._make_wav_io(wav_bytes, chunk_size=4096)
+        try:
+            raw_pcm = self._drain_pcm(io_obj)
+        finally:
+            io_obj.close()
+
+        self.assertGreater(len(raw_pcm), 0, "WavCaptureIO returned no PCM data")
+        self.assertFalse(raw_pcm.startswith(b"RIFF"), "WAV header was not stripped before returning PCM")
+
+        decoder = RobustFskFrameCodec(sample_rate=sample_rate)
+        decoded = decoder.feed_pcm(raw_pcm)
+
+        self.assertEqual(
+            len(decoded),
+            1,
+            f"Expected 1 decoded frame; got {len(decoded)} – stats={decoder.snapshot_stats()}",
+        )
+        self.assertEqual(decoded[0], payload, "Decoded frame payload does not match original")
+
+    # ------------------------------------------------------------------
+    # in.wav fixture: parse and characterise
+    # ------------------------------------------------------------------
+
+    def test_in_wav_fixture_is_parsed_and_returns_nonzero_pcm(self) -> None:
+        """Verify that in.wav is valid WAV and WavCaptureIO returns non-zero PCM.
+
+        The fixture was recorded from a session where the server successfully
+        sent a connect_ack.  Non-zero PCM confirms audio was captured from
+        the correct source (monitor of the audio output, not silence/mic).
+        """
+        in_wav = self._ROOT / "in.wav"
+        if not in_wav.exists():
+            self.skipTest("in.wav fixture not present in project root")
+
+        wav_bytes = in_wav.read_bytes()
+        # Feed a 2-second window starting at t=26s where the modem signal is present.
+        sample_rate = 48000
+        data_offset = 44  # standard 44-byte WAV header
+        signal_start_byte = data_offset + int(26.0 * sample_rate) * 2
+        signal_end_byte = signal_start_byte + int(2.0 * sample_rate) * 2
+        pcm_window = wav_bytes[signal_start_byte:signal_end_byte]
+
+        window_wav = self._build_mono_wav(pcm_window, sample_rate=sample_rate)
+
+        io_obj = self._make_wav_io(window_wav, chunk_size=len(window_wav))
+        try:
+            raw_pcm = self._drain_pcm(io_obj, max_reads=4)
+        finally:
+            io_obj.close()
+
+        self.assertGreater(len(raw_pcm), 0, "No PCM returned from in.wav fixture window")
+        self.assertFalse(raw_pcm.startswith(b"RIFF"), "WAV header was not stripped")
+        self.assertEqual(raw_pcm, pcm_window, "PCM payload was altered during WAV header strip")
+
+        samples = struct.unpack("<" + "h" * (len(raw_pcm) // 2), raw_pcm)
+        max_amp = max(abs(s) for s in samples)
+        self.assertGreater(max_amp, 1000, f"Signal window is silent (max_amp={max_amp}); expected modem audio")
+
+    def test_in_wav_fixture_signal_shows_3000hz_attenuation_bug(self) -> None:
+        """Decode the in.wav signal window with RobustFskFrameCodec and document outcome.
+
+        The PCoIP audio path severely attenuates the 3000 Hz FSK tone used
+        by the preamble ([0,3]*32 = alternating 1200/3000 Hz).  As a result
+        the preamble is decoded as [0,1,...] instead of [0,3,...] and the
+        sync gate never fires – decode yields 0 frames.  This test pins that
+        behaviour so any future improvement (e.g. pcoip-safe profile) is
+        immediately visible.
+        """
+        in_wav = self._ROOT / "in.wav"
+        if not in_wav.exists():
+            self.skipTest("in.wav fixture not present in project root")
+
+        import struct as _struct
+
+        wav_bytes = in_wav.read_bytes()
+        # Extract the 47-second modem signal window (26-73s).
+        sample_rate = 48000
+        data_offset = 44
+        sig_start = data_offset + int(26.0 * sample_rate) * 2
+        sig_end = data_offset + int(73.0 * sample_rate) * 2
+        pcm_signal = wav_bytes[sig_start:sig_end]
+
+        from gitssh.audio_modem import RobustFskFrameCodec
+
+        codec = RobustFskFrameCodec(sample_rate=sample_rate)
+        # Feed in 1-second chunks so the decoder has enough symbols to search.
+        chunk_sz = sample_rate * 2
+        all_frames: list[bytes] = []
+        for off in range(0, len(pcm_signal), chunk_sz):
+            all_frames.extend(codec.feed_pcm(pcm_signal[off : off + chunk_sz]))
+
+        stats = codec.snapshot_stats()
+        # With 3000 Hz severely attenuated, the preamble gate never fires.
+        # Zero frames decoded is the expected (buggy) outcome for this recording.
+        self.assertEqual(
+            all_frames,
+            [],
+            f"Unexpected frames decoded – 3000 Hz attenuation may have been fixed; stats={stats}",
+        )
+        # Confirm at least some sync-gate candidates were found even though they fail.
+        # (If sync_hits > 0 the gate DID fire but CRC failed – a different failure mode.)
+        self.assertEqual(stats["sync_hits"], 0, f"Expected 0 sync hits (gate never fires); got {stats}")
+
+
 if __name__ == "__main__":
     unittest.main()
