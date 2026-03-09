@@ -703,7 +703,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--audio-modulation",
         default="auto",
-        choices=["auto", "legacy", "robust-v1", "pcoip-safe"],
+        choices=["auto", "legacy", "robust-v1", "pcoip-safe", "ofdm"],
         help="Audio modulation profile for --transport audio-modem",
     )
     parser.add_argument(

@@ -12,11 +12,13 @@ import zlib
 MODULATION_LEGACY = "legacy"
 MODULATION_ROBUST_V1 = "robust-v1"
 MODULATION_PCOIP_SAFE = "pcoip-safe"
+MODULATION_OFDM = "ofdm"
 MODULATION_AUTO = "auto"
 SUPPORTED_AUDIO_MODULATIONS = (
     MODULATION_LEGACY,
     MODULATION_ROBUST_V1,
     MODULATION_PCOIP_SAFE,
+    MODULATION_OFDM,
     MODULATION_AUTO,
 )
 
@@ -48,7 +50,7 @@ def normalize_audio_modulation(value: str | None, *, allow_auto: bool = True) ->
         if allow_auto:
             return MODULATION_AUTO
         return MODULATION_LEGACY
-    if cleaned in {MODULATION_LEGACY, MODULATION_ROBUST_V1, MODULATION_PCOIP_SAFE}:
+    if cleaned in {MODULATION_LEGACY, MODULATION_ROBUST_V1, MODULATION_PCOIP_SAFE, MODULATION_OFDM}:
         return cleaned
     raise AudioCodecError(
         f"Unsupported audio modulation '{value}'. "
@@ -91,6 +93,9 @@ def create_audio_frame_codec(
             freqs=(600.0, 900.0, 1200.0, 1800.0),
             channels=2,
         )
+
+    if effective == MODULATION_OFDM:
+        return OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2)
 
     # Should never happen due normalization guard.
     raise AudioCodecError(f"Unsupported normalized audio modulation '{effective}'")
@@ -486,6 +491,261 @@ class RobustFskFrameCodec:
         return body[2:]
 
 
+class OfdmFrameCodec:
+    """OFDM BPSK audio modem — 3 subcarriers at 600/1200/1800 Hz, 1800 bps raw.
+
+    Encodes data as phase (0°/180°) across three orthogonal subcarriers so that
+    lossy compression (OPUS/ADPCM) preserves the signal; amplitude compression
+    does not affect BPSK phase decoding via Goertzel I-component.
+    """
+
+    _SUBCARRIER_FREQS = (600.0, 1200.0, 1800.0)
+    _PREAMBLE_DETECT_MIN = 32
+    _START_SYNC_MAX_BIT_ERRORS = 2
+    _END_SYNC_MAX_BIT_ERRORS = 1
+
+    # 16-symbol (48-bit) sync sequences — one bit per subcarrier.
+    _START_SYNC_BITS = [
+        0, 1, 0,  1, 0, 1,  0, 0, 1,  1, 1, 0,  0, 1, 1,  1, 0, 0,  0, 1, 0,  1, 1, 1,
+        1, 0, 1,  0, 0, 0,  1, 1, 0,  0, 0, 1,  0, 1, 1,  1, 1, 1,  0, 0, 0,  1, 0, 1,
+    ]
+    _END_SYNC_BITS = [
+        1, 0, 0,  0, 1, 0,  1, 1, 0,  0, 0, 1,  1, 0, 0,  0, 1, 1,  1, 0, 1,  0, 0, 0,
+        0, 1, 1,  1, 0, 1,  0, 0, 1,  1, 1, 0,  1, 0, 0,  0, 0, 1,  1, 1, 0,  0, 1, 0,
+    ]
+
+    def __init__(
+        self,
+        *,
+        sample_rate: int = 48000,
+        amplitude: int = 13000,
+        channels: int = 2,
+    ) -> None:
+        if sample_rate != 48000:
+            raise AudioCodecError(
+                f"OfdmFrameCodec requires sample_rate=48000, got {sample_rate}"
+            )
+        self.sample_rate = sample_rate
+        self.amplitude = max(min(amplitude, 20000), 1000)
+        self.channels = max(channels, 1)
+
+        self._n_subcarriers = len(self._SUBCARRIER_FREQS)
+        self.symbol_samples = 48000 // 600  # = 80
+        self._symbol_bytes = self.symbol_samples * 2 * self.channels
+
+        self._steps = tuple(
+            (2.0 * math.pi * freq) / float(self.sample_rate)
+            for freq in self._SUBCARRIER_FREQS
+        )
+        self._goertzel_coeffs = tuple(2.0 * math.cos(step) for step in self._steps)
+
+        self._state = "HUNT_PREAMBLE"
+        self._preamble_run = 0
+        self._preamble_end_byte = 0
+        self._sample_buffer = bytearray()
+        self._data_bits: list[int] = []
+        self._symbol_phase_offset = 0
+
+        self._frames_decoded = 0
+        self._crc_failures = 0
+        self._sync_hits = 0
+        self._decode_failures = 0
+
+    def encode_frame(self, frame: bytes) -> bytes:
+        header = struct.pack("!H", len(frame))
+        body = header + frame
+        crc = zlib.crc32(body) & 0xFFFFFFFF
+        packet = body + struct.pack("!I", crc)
+
+        bits = _bits_from_bytes(packet)
+        # Pad to multiple of n_subcarriers
+        rem = len(bits) % self._n_subcarriers
+        if rem:
+            bits.extend([0] * (self._n_subcarriers - rem))
+
+        # Group into data symbols
+        data_symbols = [
+            bits[i : i + self._n_subcarriers]
+            for i in range(0, len(bits), self._n_subcarriers)
+        ]
+
+        # Build full stream: 64 preamble + 16 start_sync + data + 16 end_sync
+        preamble_symbols = [[0] * self._n_subcarriers] * 64
+        start_sync_symbols = [
+            self._START_SYNC_BITS[i : i + self._n_subcarriers]
+            for i in range(0, len(self._START_SYNC_BITS), self._n_subcarriers)
+        ]
+        end_sync_symbols = [
+            self._END_SYNC_BITS[i : i + self._n_subcarriers]
+            for i in range(0, len(self._END_SYNC_BITS), self._n_subcarriers)
+        ]
+
+        all_symbols = preamble_symbols + start_sync_symbols + data_symbols + end_sync_symbols
+        return self._encode_ofdm_symbols_to_pcm(all_symbols)
+
+    def _encode_ofdm_symbols_to_pcm(self, symbols: list[list[int]]) -> bytes:
+        scale = self.amplitude / float(self._n_subcarriers)
+        samples: list[int] = []
+        for sym_bits in symbols:
+            for t in range(self.symbol_samples):
+                s = sum(
+                    (-1 if b else 1) * math.cos(step * t)
+                    for b, step in zip(sym_bits, self._steps)
+                )
+                sample = int(scale * s)
+                for _ in range(self.channels):
+                    samples.append(sample)
+        return struct.pack("<" + "h" * len(samples), *samples)
+
+    def feed_pcm(self, pcm: bytes) -> list[bytes]:
+        if not pcm:
+            return []
+        self._sample_buffer.extend(pcm)
+        frames: list[bytes] = []
+        self._process_buffer(frames)
+        return frames
+
+    def _process_buffer(self, frames: list[bytes]) -> None:
+        while True:
+            prev_state = self._state
+            if self._state == "HUNT_PREAMBLE":
+                self._hunt_preamble()
+            elif self._state == "HUNT_START_SYNC":
+                self._hunt_start_sync()
+            elif self._state == "COLLECT_DATA":
+                self._collect_data(frames)
+            # Stop if we didn't transition (no progress) or not enough data
+            if self._state == prev_state:
+                break
+
+    def _hunt_preamble(self) -> None:
+        pos = 0
+        while pos + self._symbol_bytes <= len(self._sample_buffer):
+            bits = self._decode_ofdm_bits_at(pos)
+            if all(b == 0 for b in bits):
+                self._preamble_run += 1
+            else:
+                if self._preamble_run >= self._PREAMBLE_DETECT_MIN:
+                    self._preamble_end_byte = pos
+                    self._preamble_run = 0
+                    # Trim old data, keep buffer from preamble_end_byte onward
+                    del self._sample_buffer[:pos]
+                    self._preamble_end_byte = 0
+                    self._state = "HUNT_START_SYNC"
+                    return
+                self._preamble_run = 0
+            pos += self._symbol_bytes
+
+        # Bound memory: keep only the last _PREAMBLE_DETECT_MIN symbols
+        max_keep = self._PREAMBLE_DETECT_MIN * self._symbol_bytes
+        if len(self._sample_buffer) > max_keep:
+            del self._sample_buffer[: len(self._sample_buffer) - max_keep]
+            self._preamble_run = 0
+
+    def _hunt_start_sync(self) -> None:
+        n_sync_symbols = len(self._START_SYNC_BITS) // self._n_subcarriers  # 16
+        best_errors = self._START_SYNC_MAX_BIT_ERRORS + 1
+        best_byte_delta = 0
+
+        for offset_samples in range(self.symbol_samples):
+            byte_delta = offset_samples * 2 * self.channels
+            if byte_delta + n_sync_symbols * self._symbol_bytes > len(self._sample_buffer):
+                break
+            errors = 0
+            for sym_idx in range(n_sync_symbols):
+                pos = byte_delta + sym_idx * self._symbol_bytes
+                bits = self._decode_ofdm_bits_at(pos)
+                expected = self._START_SYNC_BITS[
+                    sym_idx * self._n_subcarriers : (sym_idx + 1) * self._n_subcarriers
+                ]
+                for got, exp in zip(bits, expected):
+                    if got != exp:
+                        errors += 1
+            if errors < best_errors:
+                best_errors = errors
+                best_byte_delta = byte_delta
+
+        if best_errors <= self._START_SYNC_MAX_BIT_ERRORS:
+            self._sync_hits += 1
+            data_start_abs = best_byte_delta + n_sync_symbols * self._symbol_bytes
+            del self._sample_buffer[:data_start_abs]
+            self._data_bits = []
+            self._state = "COLLECT_DATA"
+        else:
+            # No match — go back to hunting preamble
+            self._preamble_run = 0
+            self._state = "HUNT_PREAMBLE"
+
+    def _collect_data(self, frames: list[bytes]) -> None:
+        n_end_sync_bits = len(self._END_SYNC_BITS)
+        pos = 0
+        while pos + self._symbol_bytes <= len(self._sample_buffer):
+            bits = self._decode_ofdm_bits_at(pos)
+            self._data_bits.extend(bits)
+            pos += self._symbol_bytes
+
+            # Check last 48 bits against end sync
+            if len(self._data_bits) >= n_end_sync_bits:
+                tail = self._data_bits[-n_end_sync_bits:]
+                errors = sum(1 for a, b in zip(tail, self._END_SYNC_BITS) if a != b)
+                if errors <= self._END_SYNC_MAX_BIT_ERRORS:
+                    data_bits = self._data_bits[:-n_end_sync_bits]
+                    frame = self._decode_frame_bits(data_bits)
+                    if frame is not None:
+                        self._frames_decoded += 1
+                        frames.append(frame)
+                    else:
+                        self._decode_failures += 1
+                    del self._sample_buffer[:pos]
+                    self._data_bits = []
+                    self._preamble_run = 0
+                    self._state = "HUNT_PREAMBLE"
+                    return
+
+        del self._sample_buffer[:pos]
+
+    def _decode_ofdm_bits_at(self, byte_pos: int) -> list[int]:
+        raw = self._sample_buffer[byte_pos : byte_pos + self._symbol_bytes]
+        count = len(raw) // 2
+        if count == 0:
+            return [0] * self._n_subcarriers
+        samples = struct.unpack("<" + "h" * count, raw)
+        return [
+            0 if sum(
+                _goertzel_real(samples[ch :: self.channels], coeff)
+                for ch in range(self.channels)
+            ) >= 0 else 1
+            for coeff in self._goertzel_coeffs
+        ]
+
+    def _decode_frame_bits(self, bits: list[int]) -> bytes | None:
+        packet = _bytes_from_bits(bits)
+        if len(packet) < 6:
+            return None
+
+        payload_len = struct.unpack("!H", packet[:2])[0]
+        needed = 2 + payload_len + 4
+        if len(packet) < needed:
+            return None
+
+        body = packet[: 2 + payload_len]
+        crc_expected = struct.unpack("!I", packet[2 + payload_len : needed])[0]
+        crc_actual = zlib.crc32(body) & 0xFFFFFFFF
+        if crc_actual != crc_expected:
+            self._crc_failures += 1
+            return None
+
+        return body[2:]
+
+    def snapshot_stats(self) -> dict[str, int]:
+        return {
+            "frames_decoded": self._frames_decoded,
+            "crc_failures": self._crc_failures,
+            "sync_hits": self._sync_hits,
+            "decode_failures": self._decode_failures,
+        }
+
+
 def _bits_from_bytes(data: bytes) -> list[int]:
     bits: list[int] = []
     for value in data:
@@ -546,3 +806,11 @@ def _goertzel_power(samples: tuple[int, ...], coeff: float) -> float:
         s_prev2 = s_prev
         s_prev = s
     return (s_prev2 * s_prev2) + (s_prev * s_prev) - (coeff * s_prev * s_prev2)
+
+
+def _goertzel_real(samples: tuple[int, ...], coeff: float) -> float:
+    """Real (in-phase) DFT component. coeff = 2*cos(step), same as _goertzel_power."""
+    s1, s2 = 0.0, 0.0
+    for x in samples:
+        s1, s2 = float(x) + coeff * s1 - s2, s1
+    return s1 * (coeff / 2.0) - s2
