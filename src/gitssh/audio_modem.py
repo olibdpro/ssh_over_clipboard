@@ -83,19 +83,19 @@ def create_audio_frame_codec(
         # PCoIP voice channels commonly apply lossy coding and dynamic bandwidth shaping.
         # Trade throughput for resilience while keeping interactive setup latency practical.
         # Use low-frequency tone set (600–1800 Hz) to avoid PCoIP high-freq attenuation.
-        # Stereo doubles the Goertzel SNR budget (L+R independent ADPCM noise), so
-        # bit_repeat can drop from 5→3, recovering ~1.67× throughput.
+        # PCoIP audio path is mono-only; channels=1 avoids pw-play rejection of stereo input.
         return RobustFskFrameCodec(
             sample_rate=max(sample_rate, 8000),
             symbol_rate=900,
             bit_repeat=3,
             amplitude=13000,
             freqs=(600.0, 900.0, 1200.0, 1800.0),
-            channels=2,
+            channels=1,
         )
 
     if effective == MODULATION_OFDM:
-        return OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2, bit_repeat=3)
+        # PCoIP audio path is mono-only; channels=1 avoids pw-play rejection of stereo input.
+        return OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=1, bit_repeat=3)
 
     # Should never happen due normalization guard.
     raise AudioCodecError(f"Unsupported normalized audio modulation '{effective}'")

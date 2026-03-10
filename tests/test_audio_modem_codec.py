@@ -87,7 +87,7 @@ class AudioFrameCodecTests(unittest.TestCase):
         self.assertIsInstance(codec, RobustFskFrameCodec)
         self.assertEqual(codec.symbol_rate, 900)
         self.assertEqual(codec.bit_repeat, 3)
-        self.assertEqual(codec.channels, 2)
+        self.assertEqual(codec.channels, 1)
         self.assertEqual(codec._freqs, (600.0, 900.0, 1200.0, 1800.0))
 
     def test_pcoip_safe_codec_round_trip_frame(self) -> None:
@@ -348,7 +348,7 @@ class OfdmFrameCodecTests(unittest.TestCase):
             marker_run=16,
         )
         self.assertIsInstance(codec, OfdmFrameCodec)
-        self.assertEqual(codec.channels, 2)
+        self.assertEqual(codec.channels, 1)
         self.assertEqual(codec.amplitude, 13000)
         self.assertEqual(codec.symbol_samples, 80)
         self.assertEqual(codec.bit_repeat, 3)
