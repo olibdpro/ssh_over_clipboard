@@ -457,6 +457,7 @@ class PulseCliAudioDuplexIO:
         output_device: str,
         monitor_stream_index: int | None = None,
         sample_rate: int,
+        channels: int = 1,
         read_timeout: float,
         write_timeout: float,
         parec_bin: str = "parec",
@@ -479,7 +480,7 @@ class PulseCliAudioDuplexIO:
         capture_cmd = [
             parec_bin,
             "--raw",
-            "--channels=1",
+            f"--channels={max(channels, 1)}",
             f"--rate={sample_rate}",
             "--format=s16le",
             "--latency-msec=30",
@@ -491,7 +492,7 @@ class PulseCliAudioDuplexIO:
             pacat_bin,
             "--raw",
             "--playback",
-            "--channels=1",
+            f"--channels={max(channels, 1)}",
             f"--rate={sample_rate}",
             "--format=s16le",
             "--latency-msec=30",
@@ -611,6 +612,7 @@ def build_audio_duplex_io(
     input_device: str,
     output_device: str,
     sample_rate: int,
+    channels: int = 1,
     read_timeout: float,
     write_timeout: float,
 ) -> AudioDuplexIO:
@@ -621,6 +623,7 @@ def build_audio_duplex_io(
             input_device=input_device,
             output_device=output_device,
             sample_rate=sample_rate,
+            channels=channels,
             read_timeout=read_timeout,
             write_timeout=write_timeout,
         )
@@ -632,6 +635,7 @@ def build_audio_duplex_io(
                 input_device=input_device,
                 output_device=output_device,
                 sample_rate=sample_rate,
+                channels=channels,
                 read_timeout=read_timeout,
                 write_timeout=write_timeout,
             )

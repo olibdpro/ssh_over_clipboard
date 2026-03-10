@@ -653,6 +653,7 @@ class PipeWireLinkAudioDuplexIO:
         capture_node_id: int,
         write_node_id: int,
         sample_rate: int,
+        channels: int = 1,
         read_timeout: float,
         write_timeout: float,
         pw_record_bin: str = "pw-record",
@@ -687,7 +688,7 @@ class PipeWireLinkAudioDuplexIO:
         self._playback_target_id = write_node_id
         self._playback_stream_header = _build_streaming_wav_header(
             sample_rate=sample_rate,
-            channels=1,
+            channels=max(channels, 1),
             bits_per_sample=16,
         )
         self._playback_header_sent = False
@@ -742,7 +743,7 @@ class PipeWireLinkAudioDuplexIO:
             "--rate",
             str(sample_rate),
             "--channels",
-            "1",
+            str(max(channels, 1)),
             "--format",
             "s16",
             "--latency",
@@ -756,7 +757,7 @@ class PipeWireLinkAudioDuplexIO:
             "--rate",
             str(sample_rate),
             "--channels",
-            "1",
+            str(max(channels, 1)),
             "--format",
             "s16",
             "--latency",
@@ -1381,6 +1382,7 @@ class PipeWireWavCaptureAudioDuplexIO(PipeWireLinkAudioDuplexIO):
         capture_wav_path: str,
         write_node_id: int,
         sample_rate: int,
+        channels: int = 1,
         read_timeout: float,
         write_timeout: float,
         pw_play_bin: str = "pw-play",
@@ -1415,7 +1417,7 @@ class PipeWireWavCaptureAudioDuplexIO(PipeWireLinkAudioDuplexIO):
         self._playback_target_id = write_node_id
         self._playback_stream_header = _build_streaming_wav_header(
             sample_rate=sample_rate,
-            channels=1,
+            channels=max(channels, 1),
             bits_per_sample=16,
         )
         self._playback_header_sent = False
@@ -1447,7 +1449,7 @@ class PipeWireWavCaptureAudioDuplexIO(PipeWireLinkAudioDuplexIO):
             "--rate",
             str(sample_rate),
             "--channels",
-            "1",
+            str(max(channels, 1)),
             "--format",
             "s16",
             "--latency",

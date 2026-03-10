@@ -268,7 +268,7 @@ Troubleshooting:
 - Inspect server defaults/devices with `pactl info`, `pactl list short sources`, and `pactl list short sinks`.
 
 Useful reliability knobs:
-- `--audio-modulation` (`auto`, `robust-v1`, `pcoip-safe`, `legacy`; default `auto`)
+- `--audio-modulation` (`auto`, `robust-v1`, `pcoip-safe`, `ofdm`, `legacy`; default `auto`)
 - `--audio-byte-repeat` (simple error-correction repeat factor, default `3`)
 - `--audio-ack-timeout-ms` / `--audio-max-retries`
 - `--audio-marker-run` (frame delimiter marker length)
@@ -279,6 +279,16 @@ For lossy remoting audio paths (for example PCoIP OPUS/ADPCM), try:
 sshg localhost \
   --transport audio-modem \
   --audio-modulation pcoip-safe
+```
+
+The `ofdm` modulation profile uses BPSK across three orthogonal subcarriers (600/1200/1800 Hz)
+with majority-vote error correction (`bit_repeat=3`). It is designed to survive PCoIP
+OPUS (32–256 kbps) and ADPCM compression while maintaining throughput comparable to `pcoip-safe`:
+
+```bash
+sshg localhost \
+  --transport audio-modem \
+  --audio-modulation ofdm
 ```
 
 ## Protocol Notes
@@ -318,6 +328,8 @@ Audio-modem transport details:
 - Uses the same `gitssh/2` message schema.
 - Encodes link frames into PCM audio packets with markers + COBS framing.
 - Includes CRC32 integrity checks, deduplication, retransmission, and a simple repeat-code FEC.
+- `ofdm` modulation: BPSK on 3 subcarriers (600/1200/1800 Hz), Goertzel decode, `bit_repeat=3`
+  majority-vote FEC. Survives PCoIP OPUS 32–256 kbps and ADPCM compression.
 
 ## Limitations
 

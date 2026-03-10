@@ -49,6 +49,7 @@ class AudioModemTransportConfig:
     ffmpeg_bin: str = "ffmpeg"
     audio_backend: str = "auto"
     verbose: bool = False
+    channels: int = 1
     io_factory: Callable[["AudioModemTransportConfig"], AudioDuplexIO] | None = None
 
 
@@ -83,6 +84,9 @@ class AudioModemTransportBackend:
             byte_repeat=max(config.byte_repeat, 1),
             marker_run=max(config.marker_run, 4),
         )
+        # Propagate the codec's channel count into config so io_factory lambdas
+        # can read config.channels and pass the right value to pw-play/parec/etc.
+        config.channels = getattr(self._codec, "channels", 1)
         self._last_codec_log_at = 0.0
         self._lock = threading.RLock()
         self._closed = False
@@ -172,6 +176,7 @@ class AudioModemTransportBackend:
                     input_device=self.config.input_device,
                     output_device=self.config.output_device,
                     sample_rate=max(self.config.sample_rate, 8000),
+                    channels=max(self.config.channels, 1),
                     read_timeout=max(self.config.read_timeout, 0.0),
                     write_timeout=max(self.config.write_timeout, 0.001),
                 )
