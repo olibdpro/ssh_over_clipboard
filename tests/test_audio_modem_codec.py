@@ -302,6 +302,35 @@ class OfdmFrameCodecTests(unittest.TestCase):
         frames = dec.feed_pcm(pcm)
         self.assertEqual(frames, [payload])
 
+    def test_ofdm_round_trip_with_sample_offset(self) -> None:
+        """Decoder receives PCM that starts mid-stream (random byte offset before the frame).
+
+        In real audio the decoder buffer begins at an arbitrary sample offset relative
+        to the transmitted signal.  The 80-offset preamble sweep must recover regardless.
+        """
+        codec = OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2)
+        payload = b"offset-alignment-test"
+        pcm = codec.encode_frame(payload)
+        for offset_samples in (0, 7, 20, 37, 63, 79):
+            with self.subTest(offset_samples=offset_samples):
+                # Prepend `offset_samples` frames of silence to simulate a misaligned start
+                silence = bytes(offset_samples * 2 * codec.channels)  # int16 stereo
+                dec = OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2)
+                frames = dec.feed_pcm(silence + pcm)
+                self.assertEqual(frames, [payload], f"failed at offset_samples={offset_samples}")
+
+    def test_ofdm_round_trip_chunked_feed(self) -> None:
+        """Decoder handles PCM fed in small chunks (simulates streaming audio)."""
+        codec = OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2)
+        payload = b"chunked-feed-test"
+        pcm = codec.encode_frame(payload)
+        dec = OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2)
+        chunk_bytes = 3840  # 20 ms at 48 kHz stereo int16
+        all_frames: list[bytes] = []
+        for i in range(0, len(pcm), chunk_bytes):
+            all_frames.extend(dec.feed_pcm(pcm[i : i + chunk_bytes]))
+        self.assertEqual(all_frames, [payload])
+
     def test_ofdm_rejects_wrong_sample_rate(self) -> None:
         from gitssh.audio_modem import AudioCodecError
         with self.assertRaises(AudioCodecError):
@@ -322,6 +351,7 @@ class OfdmFrameCodecTests(unittest.TestCase):
         self.assertEqual(codec.channels, 2)
         self.assertEqual(codec.amplitude, 13000)
         self.assertEqual(codec.symbol_samples, 80)
+        self.assertEqual(codec.bit_repeat, 3)
 
 
 @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not available")
@@ -331,7 +361,7 @@ class OfdmCompressionSurvivalTests(_CompressionTestHelpers, unittest.TestCase):
     _PAYLOAD = b"ofdm-compression-survival-test"
 
     def _make_codec(self) -> OfdmFrameCodec:
-        return OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2)
+        return OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2, bit_repeat=3)
 
     def test_ofdm_survives_opus_256kbps(self) -> None:
         codec = self._make_codec()

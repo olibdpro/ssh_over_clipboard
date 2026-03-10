@@ -95,7 +95,7 @@ def create_audio_frame_codec(
         )
 
     if effective == MODULATION_OFDM:
-        return OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2)
+        return OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2, bit_repeat=3)
 
     # Should never happen due normalization guard.
     raise AudioCodecError(f"Unsupported normalized audio modulation '{effective}'")
@@ -500,7 +500,18 @@ class OfdmFrameCodec:
     """
 
     _SUBCARRIER_FREQS = (600.0, 1200.0, 1800.0)
-    _PREAMBLE_DETECT_MIN = 32
+    # Require the full preamble (64 symbols) so the power-based end-of-preamble
+    # estimate is within ±1 symbol of reality, keeping the start-sync search small.
+    _PREAMBLE_DETECT_MIN = 64
+    # Minimum per-carrier per-channel Goertzel power to count a window as signal
+    # (not silence/noise).  Expected signal ≈ 10^9; silence ≈ 0; noise ≈ 10^2.
+    _PREAMBLE_POWER_THRESHOLD = 1e5
+    # How many sample-frames to sweep when searching for start-sync.
+    # Must exceed worst-case alignment error (≤ symbol_samples = 80 frames = 320 B
+    # for stereo) plus the encoder preamble end position uncertainty (≤ 1 symbol).
+    # Worst-case start-sync position in the trimmed buffer =
+    # 2 × symbol_bytes + (signal_start % symbol_bytes) < 3 × symbol_bytes.
+    _START_SYNC_SWEEP_FRAMES = 240  # = 3 × symbol_samples, guaranteed coverage
     _START_SYNC_MAX_BIT_ERRORS = 2
     _END_SYNC_MAX_BIT_ERRORS = 1
 
@@ -520,6 +531,7 @@ class OfdmFrameCodec:
         sample_rate: int = 48000,
         amplitude: int = 13000,
         channels: int = 2,
+        bit_repeat: int = 1,
     ) -> None:
         if sample_rate != 48000:
             raise AudioCodecError(
@@ -528,6 +540,7 @@ class OfdmFrameCodec:
         self.sample_rate = sample_rate
         self.amplitude = max(min(amplitude, 20000), 1000)
         self.channels = max(channels, 1)
+        self.bit_repeat = max(bit_repeat, 1)
 
         self._n_subcarriers = len(self._SUBCARRIER_FREQS)
         self.symbol_samples = 48000 // 600  # = 80
@@ -541,10 +554,8 @@ class OfdmFrameCodec:
 
         self._state = "HUNT_PREAMBLE"
         self._preamble_run = 0
-        self._preamble_end_byte = 0
         self._sample_buffer = bytearray()
         self._data_bits: list[int] = []
-        self._symbol_phase_offset = 0
 
         self._frames_decoded = 0
         self._crc_failures = 0
@@ -558,6 +569,9 @@ class OfdmFrameCodec:
         packet = body + struct.pack("!I", crc)
 
         bits = _bits_from_bytes(packet)
+        # Repeat each bit for majority-vote error correction
+        if self.bit_repeat > 1:
+            bits = [b for b in bits for _ in range(self.bit_repeat)]
         # Pad to multiple of n_subcarriers
         rem = len(bits) % self._n_subcarriers
         if rem:
@@ -619,50 +633,90 @@ class OfdmFrameCodec:
                 break
 
     def _hunt_preamble(self) -> None:
+        # Use POWER (alignment-independent) to detect _PREAMBLE_DETECT_MIN=64
+        # consecutive signal windows.  Power is invariant to the sample-phase
+        # offset so we don't need to try multiple alignments here.
+        # After detecting the full preamble the start-sync follows within
+        # ±symbol_bytes; _hunt_start_sync sweeps _START_SYNC_SWEEP_FRAMES exactly.
+        #
+        # Re-scan the entire buffer from pos=0 each call so that preamble_end is
+        # computed from the correct absolute buffer position (no cross-call state).
+        run = 0
         pos = 0
         while pos + self._symbol_bytes <= len(self._sample_buffer):
-            bits = self._decode_ofdm_bits_at(pos)
-            if all(b == 0 for b in bits):
-                self._preamble_run += 1
-            else:
-                if self._preamble_run >= self._PREAMBLE_DETECT_MIN:
-                    self._preamble_end_byte = pos
+            raw = self._sample_buffer[pos : pos + self._symbol_bytes]
+            count = len(raw) // 2
+            samples = struct.unpack("<" + "h" * count, raw)
+            power = sum(
+                _goertzel_power(samples[ch :: self.channels], coeff)
+                for ch in range(self.channels)
+                for coeff in self._goertzel_coeffs
+            )
+            if power > self._PREAMBLE_POWER_THRESHOLD:
+                run += 1
+                if run >= self._PREAMBLE_DETECT_MIN:
+                    # Estimated preamble end = pos + symbol_bytes (within ±1 symbol).
+                    # Trim to 2 symbols before that so _hunt_start_sync's sweep
+                    # starts before the actual start-sync boundary.
+                    preamble_end = pos + self._symbol_bytes
+                    trim_to = max(0, preamble_end - 2 * self._symbol_bytes)
+                    del self._sample_buffer[:trim_to]
                     self._preamble_run = 0
-                    # Trim old data, keep buffer from preamble_end_byte onward
-                    del self._sample_buffer[:pos]
-                    self._preamble_end_byte = 0
                     self._state = "HUNT_START_SYNC"
                     return
-                self._preamble_run = 0
+            else:
+                run = 0
             pos += self._symbol_bytes
 
-        # Bound memory: keep only the last _PREAMBLE_DETECT_MIN symbols
-        max_keep = self._PREAMBLE_DETECT_MIN * self._symbol_bytes
-        if len(self._sample_buffer) > max_keep:
-            del self._sample_buffer[: len(self._sample_buffer) - max_keep]
-            self._preamble_run = 0
+        # No preamble found — bound memory, but only when there is no active run
+        # (trimming mid-run would discard the beginning of the preamble).
+        if run == 0:
+            max_keep = self._PREAMBLE_DETECT_MIN * 2 * self._symbol_bytes
+            if len(self._sample_buffer) > max_keep:
+                del self._sample_buffer[: len(self._sample_buffer) - max_keep]
 
     def _hunt_start_sync(self) -> None:
         n_sync_symbols = len(self._START_SYNC_BITS) // self._n_subcarriers  # 16
-        best_errors = self._START_SYNC_MAX_BIT_ERRORS + 1
-        best_byte_delta = 0
+        # Sweep _START_SYNC_SWEEP_FRAMES sample-frame positions (step = 1 frame =
+        # 2*channels bytes) to cover the ±symbol_bytes uncertainty from preamble
+        # detection.  Trying every sample-frame offset makes alignment explicit
+        # and avoids the phase-sensitivity issues of the old 80-offset approach.
+        sweep_bytes = self._START_SYNC_SWEEP_FRAMES * 2 * self.channels
+        needed = sweep_bytes + n_sync_symbols * self._symbol_bytes
+        if len(self._sample_buffer) < needed:
+            return  # Wait for more data
 
-        for offset_samples in range(self.symbol_samples):
-            byte_delta = offset_samples * 2 * self.channels
+        best_errors = self._START_SYNC_MAX_BIT_ERRORS + 1
+        best_abs_i = -1.0  # tiebreaker: prefer stronger I-components
+        best_byte_delta = 0
+        frame_bytes = 2 * self.channels
+
+        # Primary key: fewest bit errors.  Secondary (tiebreaker): maximum sum of
+        # absolute Goertzel I-components.  A correctly-aligned window has full
+        # ±amplitude magnitude; a window that overlaps preamble (all-zero phase)
+        # or the wrong symbol has a partially-cancelled, smaller I-magnitude.
+        # This reliably distinguishes the true start position from spurious matches
+        # that arise because an all-zero preamble prefix never flips the I sign.
+        for byte_delta in range(0, sweep_bytes + frame_bytes, frame_bytes):
             if byte_delta + n_sync_symbols * self._symbol_bytes > len(self._sample_buffer):
                 break
             errors = 0
+            total_abs_i = 0.0
             for sym_idx in range(n_sync_symbols):
                 pos = byte_delta + sym_idx * self._symbol_bytes
-                bits = self._decode_ofdm_bits_at(pos)
-                expected = self._START_SYNC_BITS[
-                    sym_idx * self._n_subcarriers : (sym_idx + 1) * self._n_subcarriers
-                ]
-                for got, exp in zip(bits, expected):
-                    if got != exp:
+                i_vals = self._decode_ofdm_i_at(pos)
+                for iv, exp in zip(
+                    i_vals,
+                    self._START_SYNC_BITS[
+                        sym_idx * self._n_subcarriers : (sym_idx + 1) * self._n_subcarriers
+                    ],
+                ):
+                    if (iv >= 0) != (exp == 0):
                         errors += 1
-            if errors < best_errors:
+                    total_abs_i += abs(iv)
+            if errors < best_errors or (errors == best_errors and total_abs_i > best_abs_i):
                 best_errors = errors
+                best_abs_i = total_abs_i
                 best_byte_delta = byte_delta
 
         if best_errors <= self._START_SYNC_MAX_BIT_ERRORS:
@@ -673,24 +727,24 @@ class OfdmFrameCodec:
             self._state = "COLLECT_DATA"
         else:
             # No match — go back to hunting preamble
-            self._preamble_run = 0
             self._state = "HUNT_PREAMBLE"
 
     def _collect_data(self, frames: list[bytes]) -> None:
         n_end_sync_bits = len(self._END_SYNC_BITS)
+        # End-sync symbols are NOT bit-repeated; only the payload data is.
         pos = 0
         while pos + self._symbol_bytes <= len(self._sample_buffer):
             bits = self._decode_ofdm_bits_at(pos)
             self._data_bits.extend(bits)
             pos += self._symbol_bytes
 
-            # Check last 48 bits against end sync
+            # Check last n_end_sync_bits raw bits against end sync
             if len(self._data_bits) >= n_end_sync_bits:
                 tail = self._data_bits[-n_end_sync_bits:]
                 errors = sum(1 for a, b in zip(tail, self._END_SYNC_BITS) if a != b)
                 if errors <= self._END_SYNC_MAX_BIT_ERRORS:
-                    data_bits = self._data_bits[:-n_end_sync_bits]
-                    frame = self._decode_frame_bits(data_bits)
+                    data_bits_raw = self._data_bits[:-n_end_sync_bits]
+                    frame = self._decode_frame_bits(data_bits_raw)
                     if frame is not None:
                         self._frames_decoded += 1
                         frames.append(frame)
@@ -698,11 +752,25 @@ class OfdmFrameCodec:
                         self._decode_failures += 1
                     del self._sample_buffer[:pos]
                     self._data_bits = []
-                    self._preamble_run = 0
                     self._state = "HUNT_PREAMBLE"
                     return
 
         del self._sample_buffer[:pos]
+
+    def _decode_ofdm_i_at(self, byte_pos: int) -> list[float]:
+        """Return raw Goertzel I-component for each subcarrier (summed over channels)."""
+        raw = self._sample_buffer[byte_pos : byte_pos + self._symbol_bytes]
+        count = len(raw) // 2
+        if count == 0:
+            return [0.0] * self._n_subcarriers
+        samples = struct.unpack("<" + "h" * count, raw)
+        return [
+            sum(
+                _goertzel_real(samples[ch :: self.channels], coeff)
+                for ch in range(self.channels)
+            )
+            for coeff in self._goertzel_coeffs
+        ]
 
     def _decode_ofdm_bits_at(self, byte_pos: int) -> list[int]:
         raw = self._sample_buffer[byte_pos : byte_pos + self._symbol_bytes]
@@ -719,6 +787,8 @@ class OfdmFrameCodec:
         ]
 
     def _decode_frame_bits(self, bits: list[int]) -> bytes | None:
+        if self.bit_repeat > 1:
+            bits = _majority_vote(bits, self.bit_repeat)
         packet = _bytes_from_bits(bits)
         if len(packet) < 6:
             return None
@@ -744,6 +814,19 @@ class OfdmFrameCodec:
             "sync_hits": self._sync_hits,
             "decode_failures": self._decode_failures,
         }
+
+
+def _majority_vote(bits: list[int], repeat: int) -> list[int]:
+    """Collapse a bit list that was encoded with `repeat` copies per bit.
+
+    For each group of `repeat` consecutive bits, vote: 1 if majority are 1,
+    else 0.  Trailing incomplete groups are dropped.
+    """
+    out: list[int] = []
+    for i in range(0, len(bits) - repeat + 1, repeat):
+        group = bits[i : i + repeat]
+        out.append(1 if sum(group) > repeat // 2 else 0)
+    return out
 
 
 def _bits_from_bytes(data: bytes) -> list[int]:
