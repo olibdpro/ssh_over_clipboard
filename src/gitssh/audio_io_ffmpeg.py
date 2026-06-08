@@ -460,6 +460,7 @@ class PulseCliAudioDuplexIO:
         channels: int = 1,
         read_timeout: float,
         write_timeout: float,
+        latency_msec: int = 30,
         parec_bin: str = "parec",
         pacat_bin: str = "pacat",
     ) -> None:
@@ -477,13 +478,14 @@ class PulseCliAudioDuplexIO:
             arg_name="playback sink",
         )
 
+        lat = max(latency_msec, 2)
         capture_cmd = [
             parec_bin,
             "--raw",
             f"--channels={max(channels, 1)}",
             f"--rate={sample_rate}",
             "--format=s16le",
-            "--latency-msec=30",
+            f"--latency-msec={lat}",
             f"--device={resolved_input}",
         ]
         if monitor_stream_index is not None:
@@ -495,7 +497,7 @@ class PulseCliAudioDuplexIO:
             f"--channels={max(channels, 1)}",
             f"--rate={sample_rate}",
             "--format=s16le",
-            "--latency-msec=30",
+            f"--latency-msec={lat}",
             f"--device={resolved_output}",
         ]
 

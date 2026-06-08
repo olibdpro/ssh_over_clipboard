@@ -16,8 +16,11 @@ if str(SRC) not in sys.path:
 from gitssh.audio_modem import (
     AudioFrameCodec,
     OfdmFrameCodec,
+    OfdmHighRateCodec,
     RobustFskFrameCodec,
     create_audio_frame_codec,
+    _hamming74_decode,
+    _hamming74_encode,
 )
 
 
@@ -68,14 +71,18 @@ class AudioFrameCodecTests(unittest.TestCase):
         frames = codec.feed_pcm(noisy_pcm)
         self.assertEqual(frames, [payload])
 
-    def test_create_codec_auto_uses_robust_profile(self) -> None:
+    def test_create_codec_auto_uses_high_rate_ofdm_profile(self) -> None:
+        # 'auto' is the default selector; it now resolves to the high-rate OFDM
+        # profile, tuned for the PCoIP/OPUS audio path this transport targets.
         codec = create_audio_frame_codec(
             modulation="auto",
             sample_rate=48000,
             byte_repeat=3,
             marker_run=16,
         )
-        self.assertIsInstance(codec, RobustFskFrameCodec)
+        self.assertIsInstance(codec, OfdmHighRateCodec)
+        self.assertEqual(codec._n_subcarriers, 8)
+        self.assertEqual(codec.channels, 1)
 
     def test_create_codec_pcoip_safe_uses_resilient_fsk_profile(self) -> None:
         codec = create_audio_frame_codec(
@@ -354,6 +361,79 @@ class OfdmFrameCodecTests(unittest.TestCase):
         self.assertEqual(codec.bit_repeat, 3)
 
 
+class OfdmHighRateCodecTests(unittest.TestCase):
+    """Unit tests for the high-rate OFDM codec (8 carriers + Hamming(7,4))."""
+
+    def test_hamming74_corrects_every_single_bit_error(self) -> None:
+        for value in range(16):
+            data = [(value >> bit) & 1 for bit in (3, 2, 1, 0)]
+            codeword = _hamming74_encode(data)
+            self.assertEqual(_hamming74_decode(codeword), data)
+            for flip in range(7):
+                corrupted = codeword[:]
+                corrupted[flip] ^= 1
+                self.assertEqual(
+                    _hamming74_decode(corrupted), data,
+                    f"failed to correct error at position {flip} for data {data}",
+                )
+
+    def test_eight_subcarriers_in_opus_band(self) -> None:
+        codec = OfdmHighRateCodec()
+        self.assertEqual(codec._n_subcarriers, 8)
+        self.assertEqual(codec.channels, 1)
+        self.assertEqual(codec.symbol_samples, 80)
+        # All subcarriers in the 600-4800 Hz band that survives 48 kbps OPUS.
+        self.assertEqual(codec._SUBCARRIER_FREQS[0], 600.0)
+        self.assertEqual(codec._SUBCARRIER_FREQS[-1], 4800.0)
+
+    def test_round_trip_frame(self) -> None:
+        for payload in (b"", b"hr", b"high-rate-ofdm-hello", bytes(range(256))):
+            with self.subTest(n=len(payload)):
+                enc = OfdmHighRateCodec()
+                dec = OfdmHighRateCodec()
+                frames = dec.feed_pcm(enc.encode_frame(payload))
+                self.assertEqual(frames, [payload])
+
+    def test_round_trip_with_sample_offset(self) -> None:
+        enc = OfdmHighRateCodec()
+        payload = b"offset-alignment-hr"
+        pcm = enc.encode_frame(payload)
+        for offset_samples in (0, 7, 37, 79):
+            with self.subTest(offset_samples=offset_samples):
+                silence = bytes(offset_samples * 2 * enc.channels)
+                dec = OfdmHighRateCodec()
+                self.assertEqual(dec.feed_pcm(silence + pcm), [payload])
+
+    def test_round_trip_chunked_feed(self) -> None:
+        enc = OfdmHighRateCodec()
+        payload = b"chunked-feed-hr-test"
+        pcm = enc.encode_frame(payload)
+        dec = OfdmHighRateCodec()
+        all_frames: list[bytes] = []
+        for i in range(0, len(pcm), 1920):  # 20 ms at 48 kHz mono int16
+            all_frames.extend(dec.feed_pcm(pcm[i : i + 1920]))
+        self.assertEqual(all_frames, [payload])
+
+    def test_higher_goodput_than_base_ofdm(self) -> None:
+        payload = bytes(220)
+        base_pcm = OfdmFrameCodec(sample_rate=48000, channels=1, bit_repeat=3).encode_frame(payload)
+        hr_pcm = OfdmHighRateCodec().encode_frame(payload)
+        # ~4x fewer PCM samples for the same payload (3x->1.75x FEC + 3->8 carriers).
+        self.assertLess(len(hr_pcm), len(base_pcm) / 3.0)
+
+    def test_create_codec_ofdm_hr_profile(self) -> None:
+        codec = create_audio_frame_codec(
+            modulation="ofdm-hr",
+            sample_rate=48000,
+            byte_repeat=1,
+            marker_run=16,
+        )
+        self.assertIsInstance(codec, OfdmHighRateCodec)
+        self.assertEqual(codec.channels, 1)
+        self.assertEqual(codec.symbol_samples, 80)
+        self.assertEqual(codec._n_subcarriers, 8)
+
+
 @unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not available")
 class OfdmCompressionSurvivalTests(_CompressionTestHelpers, unittest.TestCase):
     """Verify the OFDM modem survives PCoIP audio codec compression."""
@@ -391,6 +471,37 @@ class OfdmCompressionSurvivalTests(_CompressionTestHelpers, unittest.TestCase):
         frames = dec.feed_pcm(
             self._adpcm_roundtrip(pcm, 48000, adpcm_channels=codec.channels, pcm_channels=codec.channels)
         )
+        self.assertEqual(frames, [self._PAYLOAD])
+
+
+@unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not available")
+class OfdmHighRateCompressionSurvivalTests(_CompressionTestHelpers, unittest.TestCase):
+    """Verify the high-rate OFDM modem survives good-quality OPUS tiers.
+
+    The high-rate profile (8 carriers, Hamming(7,4)) is tuned for >= 48 kbps OPUS,
+    which is the modern PCoIP tier.  It deliberately trades the heavily-degraded
+    (<= 32 kbps) robustness of the base 'ofdm' profile for ~4x the goodput, so only
+    the 256 kbps and 48 kbps tiers are asserted here.  Mono matches the codec's
+    PCoIP configuration.
+    """
+
+    _PAYLOAD = b"ofdm-high-rate-compression-survival-payload-0123456789"
+
+    def _make_codec(self) -> OfdmHighRateCodec:
+        return OfdmHighRateCodec(sample_rate=48000, amplitude=16000, channels=1)
+
+    def test_high_rate_survives_opus_256kbps(self) -> None:
+        codec = self._make_codec()
+        pcm = codec.encode_frame(self._PAYLOAD)
+        dec = self._make_codec()
+        frames = dec.feed_pcm(self._opus_roundtrip(pcm, 256_000, channels=codec.channels))
+        self.assertEqual(frames, [self._PAYLOAD])
+
+    def test_high_rate_survives_opus_48kbps(self) -> None:
+        codec = self._make_codec()
+        pcm = codec.encode_frame(self._PAYLOAD)
+        dec = self._make_codec()
+        frames = dec.feed_pcm(self._opus_roundtrip(pcm, 48_000, channels=codec.channels))
         self.assertEqual(frames, [self._PAYLOAD])
 
 

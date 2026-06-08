@@ -131,7 +131,7 @@ class GitClientCliTests(unittest.TestCase):
 
         self.assertEqual(
             backend.name(),
-            "audio-modem:pipewire-link:robust-v1:in=pw-node:11,out=pw-node:22",
+            "audio-modem:pipewire-link:ofdm-hr:in=pw-node:11,out=pw-node:22",
         )
         preflight.assert_called_once_with(capture_node_id=11, write_node_id=22)
         resolve_capture.assert_called_once()
@@ -245,7 +245,7 @@ class GitClientCliTests(unittest.TestCase):
 
         self.assertEqual(
             backend.name(),
-            "audio-modem:pipewire-link:robust-v1:in=wav-path:/tmp/inbound.wav,out=pw-node:22",
+            "audio-modem:pipewire-link:ofdm-hr:in=wav-path:/tmp/inbound.wav,out=pw-node:22",
         )
         preflight.assert_called_once_with(capture_node_id=None, write_node_id=22)
         resolve_capture.assert_not_called()
@@ -380,7 +380,7 @@ class GitServerCliTests(unittest.TestCase):
 
         self.assertEqual(
             backend.name(),
-            "audio-modem:pulse-cli:robust-v1:in=mic.default,out=speaker.default",
+            "audio-modem:pulse-cli:ofdm-hr:in=mic.default,out=speaker.default",
         )
         backend.close()
 

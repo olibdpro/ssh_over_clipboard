@@ -13,12 +13,14 @@ MODULATION_LEGACY = "legacy"
 MODULATION_ROBUST_V1 = "robust-v1"
 MODULATION_PCOIP_SAFE = "pcoip-safe"
 MODULATION_OFDM = "ofdm"
+MODULATION_OFDM_HR = "ofdm-hr"
 MODULATION_AUTO = "auto"
 SUPPORTED_AUDIO_MODULATIONS = (
     MODULATION_LEGACY,
     MODULATION_ROBUST_V1,
     MODULATION_PCOIP_SAFE,
     MODULATION_OFDM,
+    MODULATION_OFDM_HR,
     MODULATION_AUTO,
 )
 
@@ -50,7 +52,13 @@ def normalize_audio_modulation(value: str | None, *, allow_auto: bool = True) ->
         if allow_auto:
             return MODULATION_AUTO
         return MODULATION_LEGACY
-    if cleaned in {MODULATION_LEGACY, MODULATION_ROBUST_V1, MODULATION_PCOIP_SAFE, MODULATION_OFDM}:
+    if cleaned in {
+        MODULATION_LEGACY,
+        MODULATION_ROBUST_V1,
+        MODULATION_PCOIP_SAFE,
+        MODULATION_OFDM,
+        MODULATION_OFDM_HR,
+    }:
         return cleaned
     raise AudioCodecError(
         f"Unsupported audio modulation '{value}'. "
@@ -68,7 +76,9 @@ def create_audio_frame_codec(
     """Build a codec implementation for the requested modulation profile."""
 
     normalized = normalize_audio_modulation(modulation, allow_auto=True)
-    effective = MODULATION_ROBUST_V1 if normalized == MODULATION_AUTO else normalized
+    # 'auto' selects the high-rate OFDM profile: this transport targets PCoIP/OPUS
+    # audio paths (48 kHz), where ofdm-hr gives ~4x the goodput of the other codecs.
+    effective = MODULATION_OFDM_HR if normalized == MODULATION_AUTO else normalized
 
     if effective == MODULATION_LEGACY:
         return AudioFrameCodec(
@@ -96,6 +106,11 @@ def create_audio_frame_codec(
     if effective == MODULATION_OFDM:
         # PCoIP audio path is mono-only; channels=1 avoids pw-play rejection of stereo input.
         return OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=1, bit_repeat=3)
+
+    if effective == MODULATION_OFDM_HR:
+        # High-rate OFDM (~4x ofdm goodput) for good-quality (>=48 kbps) OPUS paths.
+        # PCoIP audio path is mono-only; channels=1 avoids pw-play rejection of stereo input.
+        return OfdmHighRateCodec(sample_rate=48000, amplitude=16000, channels=1)
 
     # Should never happen due normalization guard.
     raise AudioCodecError(f"Unsupported normalized audio modulation '{effective}'")
@@ -568,10 +583,8 @@ class OfdmFrameCodec:
         crc = zlib.crc32(body) & 0xFFFFFFFF
         packet = body + struct.pack("!I", crc)
 
-        bits = _bits_from_bytes(packet)
-        # Repeat each bit for majority-vote error correction
-        if self.bit_repeat > 1:
-            bits = [b for b in bits for _ in range(self.bit_repeat)]
+        # Apply forward error correction (default: per-bit repetition).
+        bits = self._fec_encode(_bits_from_bytes(packet))
         # Pad to multiple of n_subcarriers
         rem = len(bits) % self._n_subcarriers
         if rem:
@@ -786,9 +799,20 @@ class OfdmFrameCodec:
             for coeff in self._goertzel_coeffs
         ]
 
-    def _decode_frame_bits(self, bits: list[int]) -> bytes | None:
+    def _fec_encode(self, bits: list[int]) -> list[int]:
+        """Forward-error-correction encode. Default: per-bit repetition."""
         if self.bit_repeat > 1:
-            bits = _majority_vote(bits, self.bit_repeat)
+            return [b for b in bits for _ in range(self.bit_repeat)]
+        return bits
+
+    def _fec_decode(self, bits: list[int]) -> list[int]:
+        """Forward-error-correction decode. Default: majority vote over repeats."""
+        if self.bit_repeat > 1:
+            return _majority_vote(bits, self.bit_repeat)
+        return bits
+
+    def _decode_frame_bits(self, bits: list[int]) -> bytes | None:
+        bits = self._fec_decode(bits)
         packet = _bytes_from_bits(bits)
         if len(packet) < 6:
             return None
@@ -814,6 +838,117 @@ class OfdmFrameCodec:
             "sync_hits": self._sync_hits,
             "decode_failures": self._decode_failures,
         }
+
+
+class OfdmHighRateCodec(OfdmFrameCodec):
+    """High-rate OFDM: 8 BPSK subcarriers (600-4800 Hz) + Hamming(7,4) FEC.
+
+    Tuned empirically for OPUS-compressed channels.  OPUS preserves tone presence
+    (BPSK sign via the Goertzel I-component) but mangles fine phase, so this stays
+    BPSK rather than going to QPSK, and widens from the base codec's 3 subcarriers
+    to the 8 that survive 48 kbps OPUS — 600-4800 Hz at 600 Hz spacing.  Above
+    ~4800 Hz, OPUS quantization corrupts the tones (measured BER climbs sharply).
+
+    Hamming(7,4) replaces the base codec's 3x bit-repeat, cutting FEC overhead from
+    3x to 1.75x while still correcting one bit error per 7-bit block; OPUS bit
+    errors are scattered (not bursty), so no interleaving is needed.
+
+    Goodput is ~2.4 kbps vs ~0.6 kbps for the base 3-carrier OFDM (~4x), measured
+    at 15/15 frame survival through 48 kbps OPUS.  It trades robustness on heavily
+    degraded channels (<=32 kbps OPUS), where the base 'ofdm' profile should be
+    used instead.
+    """
+
+    _SUBCARRIER_FREQS = (
+        600.0, 1200.0, 1800.0, 2400.0, 3000.0, 3600.0, 4200.0, 4800.0,
+    )
+
+    # 16-symbol sync sequences (16 x 8 subcarriers = 128 bits each), balanced and
+    # well-separated (Hamming distance 67) so start/end are not confused with each
+    # other or with the all-zero-phase preamble.
+    _START_SYNC_BITS = [
+        0, 1, 1, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1, 0, 1, 0,
+        0, 0, 0, 0, 0, 1, 0, 1, 1, 1, 1, 0, 1, 1, 1, 0,
+        0, 1, 0, 0, 1, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 1,
+        1, 0, 0, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 1,
+        1, 0, 1, 1, 0, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 0,
+        1, 1, 0, 1, 1, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 1,
+        1, 0, 1, 0, 0, 0, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1,
+        0, 1, 0, 0, 0, 1, 1, 1, 0, 0, 1, 0, 1, 0, 0, 0,
+    ]
+    _END_SYNC_BITS = [
+        0, 1, 0, 0, 0, 1, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0,
+        1, 1, 1, 1, 1, 0, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0,
+        1, 1, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0,
+        0, 1, 1, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1,
+        1, 0, 1, 0, 0, 0, 0, 1, 1, 0, 0, 1, 1, 1, 1, 0,
+        1, 0, 1, 1, 0, 0, 0, 1, 1, 0, 1, 1, 0, 1, 1, 1,
+        0, 0, 0, 1, 1, 1, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0,
+        1, 0, 0, 1, 1, 1, 0, 0, 0, 1, 1, 0, 0, 0, 1, 1,
+    ]
+
+    def __init__(
+        self,
+        *,
+        sample_rate: int = 48000,
+        amplitude: int = 16000,
+        channels: int = 1,
+        bit_repeat: int = 1,
+    ) -> None:
+        # Hamming(7,4) supplies the FEC, so the base per-bit repetition is disabled.
+        del bit_repeat
+        super().__init__(
+            sample_rate=sample_rate,
+            amplitude=amplitude,
+            channels=channels,
+            bit_repeat=1,
+        )
+
+    def _fec_encode(self, bits: list[int]) -> list[int]:
+        pad = (-len(bits)) % 4
+        if pad:
+            bits = bits + [0] * pad
+        out: list[int] = []
+        for i in range(0, len(bits), 4):
+            out.extend(_hamming74_encode(bits[i : i + 4]))
+        return out
+
+    def _fec_decode(self, bits: list[int]) -> list[int]:
+        out: list[int] = []
+        # Decode whole 7-bit codewords; trailing symbol-padding bits (< 7) are
+        # dropped, and any extra garbage codewords are ignored by the frame's
+        # length header + CRC.
+        for i in range(0, len(bits) - 6, 7):
+            out.extend(_hamming74_decode(bits[i : i + 7]))
+        return out
+
+
+def _hamming74_encode(d: list[int]) -> list[int]:
+    """Encode 4 data bits into a 7-bit Hamming codeword (parity at positions 1,2,4).
+
+    Layout: [p1, p2, d0, p4, d1, d2, d3].
+    """
+    d0, d1, d2, d3 = d[0], d[1], d[2], d[3]
+    p1 = d0 ^ d1 ^ d3
+    p2 = d0 ^ d2 ^ d3
+    p4 = d1 ^ d2 ^ d3
+    return [p1, p2, d0, p4, d1, d2, d3]
+
+
+def _hamming74_decode(c: list[int]) -> list[int]:
+    """Decode a 7-bit Hamming codeword to 4 data bits, correcting one bit error."""
+    c1, c2, c3, c4, c5, c6, c7 = c
+    s1 = c1 ^ c3 ^ c5 ^ c7
+    s2 = c2 ^ c3 ^ c6 ^ c7
+    s4 = c4 ^ c5 ^ c6 ^ c7
+    syndrome = s1 | (s2 << 1) | (s4 << 2)
+    if syndrome:
+        pos = syndrome - 1  # 1-indexed syndrome -> 0-indexed bit position
+        if 0 <= pos < 7:
+            corrected = list(c)
+            corrected[pos] ^= 1
+            c1, c2, c3, c4, c5, c6, c7 = corrected
+    return [c3, c5, c6, c7]
 
 
 def _majority_vote(bits: list[int], repeat: int) -> list[int]:

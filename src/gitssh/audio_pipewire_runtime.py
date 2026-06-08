@@ -1138,6 +1138,7 @@ class PipeWireLinkAudioDuplexIO:
         setattr(self, attr_name, None)
 
     def _wait_for_process_stability(self) -> None:
+        # Phase 1: short crash-detection window (0.2 s).
         deadline = time.monotonic() + 0.2
         while time.monotonic() < deadline:
             if self._capture.poll() is not None:
@@ -1147,6 +1148,28 @@ class PipeWireLinkAudioDuplexIO:
             if self._capture_tail.poll() is not None:
                 raise PipeWireRuntimeError(_process_stderr(self._capture_tail, "tail capture stream"))
             time.sleep(0.01)
+
+        # Phase 2: wait for both pw-record and pw-play to register their PipeWire
+        # nodes (up to 2 s additional).  On slow systems or when the session manager
+        # is busy, node registration can take several hundred milliseconds; if we
+        # try to set up explicit links before the nodes appear the link fails and we
+        # fall back to --target direct mode, which does NOT route to Stream/Input/Audio
+        # targets (such as the PCoIP virtual microphone) reliably.
+        if self._routing_mode != "explicit_link":
+            return
+        deadline2 = time.monotonic() + 2.0
+        while time.monotonic() < deadline2:
+            self._refresh_dynamic_link_nodes()
+            if (
+                self._capture_link_target_id is not None
+                and self._playback_link_source_id is not None
+            ):
+                return
+            if self._capture.poll() is not None:
+                raise PipeWireRuntimeError(_process_stderr(self._capture, "pw-record capture"))
+            if self._playback.poll() is not None:
+                raise PipeWireRuntimeError(_process_stderr(self._playback, "pw-play playback"))
+            time.sleep(0.05)
 
     def _ensure_links_ready(self) -> None:
         start_idx = len(self._linked_pairs)

@@ -13,7 +13,7 @@ import zlib
 
 from .audio_io_ffmpeg import AudioDuplexIO, AudioIOError, build_audio_duplex_io
 from .audio_modem import (
-    MODULATION_ROBUST_V1,
+    MODULATION_OFDM_HR,
     AudioModulationCodec,
     create_audio_frame_codec,
     normalize_audio_modulation,
@@ -25,6 +25,7 @@ _LINK_MAGIC = b"AUDM"
 _LINK_VERSION = 1
 _LINK_TYPE_DATA = 1
 _LINK_TYPE_ACK = 2
+_LINK_TYPE_DATA_Z = 3  # DATA with zlib-compressed payload; CRC covers the compressed bytes
 _LINK_HEADER = struct.Struct("!4sBBIII")
 
 
@@ -60,12 +61,13 @@ class _PendingFrame:
     queued: bool = False
     attempts: int = 0
     next_retry_at: float = 0.0
+    encoded_pcm: bytes | None = None  # cached on first transmit; reused on retransmit
 
 
 @dataclass
 class _TxItem:
     seq: int | None
-    frame: bytes
+    pcm: bytes  # already encoded; avoids re-encoding on every retransmit
 
 
 class AudioModemTransportBackend:
@@ -75,8 +77,9 @@ class AudioModemTransportBackend:
         self.config = config
         self._io: AudioDuplexIO | None = None
         normalized_modulation = normalize_audio_modulation(config.audio_modulation, allow_auto=True)
+        # 'auto' resolves to the high-rate OFDM profile (PCoIP/OPUS-tuned default).
         self._effective_modulation = (
-            MODULATION_ROBUST_V1 if normalized_modulation == "auto" else normalized_modulation
+            MODULATION_OFDM_HR if normalized_modulation == "auto" else normalized_modulation
         )
         self._codec: AudioModulationCodec = create_audio_frame_codec(
             modulation=self._effective_modulation,
@@ -134,11 +137,19 @@ class AudioModemTransportBackend:
                 f"Serialized message exceeds frame_max_bytes ({len(payload)} > {self.config.frame_max_bytes})"
             )
 
+        compressed = zlib.compress(payload, level=1)
+        if len(compressed) < len(payload):
+            wire_payload = compressed
+            frame_type = _LINK_TYPE_DATA_Z
+        else:
+            wire_payload = payload
+            frame_type = _LINK_TYPE_DATA
+
         with self._lock:
             self._ensure_open_locked()
             seq = self._next_out_seq
             self._next_out_seq += 1
-            frame = self._build_link_frame(frame_type=_LINK_TYPE_DATA, seq=seq, payload=payload)
+            frame = self._build_link_frame(frame_type=frame_type, seq=seq, payload=wire_payload)
             self._pending[seq] = _PendingFrame(seq=seq, frame=frame)
             return message.msg_id
 
@@ -204,7 +215,8 @@ class AudioModemTransportBackend:
 
     def _enqueue_due_frames_locked(self, now: float) -> None:
         while self._ack_frames:
-            self._tx_queue.append(_TxItem(seq=None, frame=self._ack_frames.popleft()))
+            raw = self._ack_frames.popleft()
+            self._tx_queue.append(_TxItem(seq=None, pcm=self._codec.encode_frame(raw)))
 
         for seq in sorted(self._pending):
             pending = self._pending.get(seq)
@@ -220,9 +232,13 @@ class AudioModemTransportBackend:
                         f"Frame seq={seq} was not acknowledged after {pending.attempts} retransmissions"
                     )
 
+            # Encode once; reuse the cached PCM on every retransmit.
+            if pending.encoded_pcm is None:
+                pending.encoded_pcm = self._codec.encode_frame(pending.frame)
+
             pending.queued = True
             pending.next_retry_at = now + max(self.config.ack_timeout, 0.01)
-            self._tx_queue.append(_TxItem(seq=pending.seq, frame=pending.frame))
+            self._tx_queue.append(_TxItem(seq=pending.seq, pcm=pending.encoded_pcm))
 
     def _write_due_frames_locked(self) -> None:
         io_obj = self._io
@@ -230,9 +246,8 @@ class AudioModemTransportBackend:
             return
         while self._tx_queue:
             item = self._tx_queue.popleft()
-            pcm = self._codec.encode_frame(item.frame)
             try:
-                io_obj.write(pcm)
+                io_obj.write(item.pcm)
             except AudioIOError as exc:
                 if item.seq is None:
                     # Keep ACK frames queued so a transient sink stall does not lose them.
@@ -265,7 +280,7 @@ class AudioModemTransportBackend:
             self._pending.pop(seq, None)
             return
 
-        if frame_type != _LINK_TYPE_DATA:
+        if frame_type not in (_LINK_TYPE_DATA, _LINK_TYPE_DATA_Z):
             return
 
         if (zlib.crc32(payload) & 0xFFFFFFFF) != payload_crc:
@@ -275,6 +290,12 @@ class AudioModemTransportBackend:
 
         if self._seen_seq(seq):
             return
+
+        if frame_type == _LINK_TYPE_DATA_Z:
+            try:
+                payload = zlib.decompress(payload)
+            except zlib.error:
+                return
 
         text = payload.decode("utf-8", errors="ignore")
         message = decode_message(text)
@@ -296,7 +317,7 @@ class AudioModemTransportBackend:
         return False
 
     def _build_link_frame(self, *, frame_type: int, seq: int, payload: bytes) -> bytes:
-        payload_crc = zlib.crc32(payload) & 0xFFFFFFFF if frame_type == _LINK_TYPE_DATA else 0
+        payload_crc = zlib.crc32(payload) & 0xFFFFFFFF if frame_type in (_LINK_TYPE_DATA, _LINK_TYPE_DATA_Z) else 0
         header = _LINK_HEADER.pack(
             _LINK_MAGIC,
             _LINK_VERSION,

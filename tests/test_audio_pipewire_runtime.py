@@ -581,6 +581,83 @@ class PipeWireRuntimeTests(unittest.TestCase):
         self.assertTrue(playback_proc._terminated)
         self.assertGreaterEqual(unlink.call_count, 1)
 
+    def test_wait_for_process_stability_polls_until_stream_nodes_appear(self) -> None:
+        """Regression: pw-play/pw-record may register their PipeWire nodes slightly
+        after process start.  _wait_for_process_stability must retry node discovery
+        so that the explicit-link path succeeds even when the first lookup returns
+        id=None (the bug that caused frames_decoded=0 on real PCoIP paths)."""
+        base_nodes = [
+            PipeWireNode(49, "capture.node", "capture", "app", "Stream/Output/Audio"),
+            PipeWireNode(44, "write.node", "write", "app", "Stream/Input/Audio"),
+        ]
+        capture_proc = _FakeProc()
+        playback_proc = _FakeProc()
+
+        # Simulate late registration: first two list_nodes calls return only the
+        # user-selected nodes (no sshg_capture/sshg_playback yet); third call returns
+        # them.  _wait_for_process_stability must keep polling until they appear.
+        call_count = 0
+        sshg_capture_node: PipeWireNode | None = None
+        sshg_playback_node: PipeWireNode | None = None
+
+        def late_list_nodes() -> list[PipeWireNode]:
+            nonlocal call_count, sshg_capture_node, sshg_playback_node
+            call_count += 1
+            if call_count <= 2:
+                return list(base_nodes)
+            # On 3rd call the sshg nodes finally appear.
+            nodes = list(base_nodes)
+            sshg_capture_node = PipeWireNode(91, "sshg_capture_XXX", "cap", "pw-record", "Stream/Input/Audio")
+            sshg_playback_node = PipeWireNode(92, "sshg_playback_XXX", "play", "pw-play", "Stream/Output/Audio")
+            nodes.extend([sshg_capture_node, sshg_playback_node])
+            return nodes
+
+        with (
+            mock.patch("gitssh.audio_pipewire_runtime.list_nodes", side_effect=late_list_nodes),
+            mock.patch("gitssh.audio_pipewire_runtime._default_sink_name_from_pactl", return_value=None),
+            mock.patch("gitssh.audio_pipewire_runtime.time.sleep"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.mkfifo"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.open", side_effect=[100, 101, 102, 103]),
+            mock.patch("gitssh.audio_pipewire_runtime.os.set_blocking"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.close"),
+            mock.patch("gitssh.audio_pipewire_runtime.os.unlink"),
+            mock.patch(
+                "gitssh.audio_pipewire_runtime.subprocess.Popen",
+                side_effect=[capture_proc, playback_proc, _FakeProc(stdout_fd=201)],
+            ),
+            mock.patch(
+                "gitssh.audio_pipewire_runtime._ports_for_node",
+                side_effect=[
+                    (["capture.node:monitor_FL"], "capture.node:monitor_FL"),
+                    (["write.node:input_FL"], "write.node:input_FL"),
+                ],
+            ),
+            mock.patch.object(
+                PipeWireLinkAudioDuplexIO,
+                "_pipewire_has_visible_ports",
+                return_value=True,
+            ),
+            mock.patch.object(PipeWireLinkAudioDuplexIO, "_ensure_links_ready", return_value=None),
+        ):
+            # Patch monotonic so the Phase-2 loop runs: first calls are "early", enough
+            # calls pass to satisfy the 2-second deadline on the 3rd list_nodes call.
+            t_values = [0.0, 0.01, 0.02, 0.03, 0.21, 0.26, 0.31, 0.36] + [10.0] * 10
+            t_iter = iter(t_values)
+            with mock.patch("gitssh.audio_pipewire_runtime.time.monotonic", side_effect=t_iter):
+                io_obj = PipeWireLinkAudioDuplexIO(
+                    capture_node_id=49,
+                    write_node_id=44,
+                    sample_rate=48000,
+                    read_timeout=0.01,
+                    write_timeout=0.05,
+                )
+            # Nodes were eventually found — explicit link mode was preserved
+            self.assertEqual(io_obj._routing_mode, "explicit_link")
+            self.assertIsNotNone(io_obj._playback_link_source_id)
+            self.assertIsNotNone(io_obj._capture_link_target_id)
+            self.assertGreaterEqual(call_count, 3)
+            io_obj.close()
+
     def test_duplex_late_link_failure_uses_sink_capture_target_when_available(self) -> None:
         nodes = [
             PipeWireNode(49, "capture.node", "capture", "app", "Stream/Output/Audio"),
