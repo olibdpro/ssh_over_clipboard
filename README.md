@@ -268,7 +268,8 @@ Troubleshooting:
 - Inspect server defaults/devices with `pactl info`, `pactl list short sources`, and `pactl list short sinks`.
 
 Useful reliability knobs:
-- `--audio-modulation` (`auto`, `robust-v1`, `pcoip-safe`, `ofdm`, `legacy`; default `auto`)
+- `--audio-modulation` (`auto`, `legacy`, `robust-v1`, `pcoip-safe`, `ofdm`, `ofdm-hr`; default `auto`)
+- `auto` selects `ofdm-hr` (high-rate OFDM, ~4x ofdm goodput, tuned for >=48 kbps OPUS paths)
 - `--audio-byte-repeat` (simple error-correction repeat factor, default `3`)
 - `--audio-ack-timeout-ms` / `--audio-max-retries`
 - `--audio-marker-run` (frame delimiter marker length)
@@ -289,6 +290,19 @@ OPUS (32–256 kbps) and ADPCM compression while maintaining throughput comparab
 sshg localhost \
   --transport audio-modem \
   --audio-modulation ofdm
+```
+
+`ofdm-hr` is the new high-rate OFDM profile (the `auto` default). It widens the
+codec to 8 BPSK subcarriers at 600 Hz spacing (600/1200/1800/2400/3000/3600/4200/4800 Hz)
+and replaces the 3x bit-repeat FEC with Hamming(7,4), cutting FEC overhead from 3x
+to 1.75x. Goodput is ~2.4 kbps (~4x `ofdm`), measured at 15/15 frame survival through
+48 kbps OPUS. It trades robustness on heavily degraded channels (<=32 kbps OPUS),
+where the base `ofdm` profile should be used instead:
+
+```bash
+sshg localhost \
+  --transport audio-modem \
+  --audio-modulation ofdm-hr
 ```
 
 ## Protocol Notes
@@ -330,6 +344,11 @@ Audio-modem transport details:
 - Includes CRC32 integrity checks, deduplication, retransmission, and a simple repeat-code FEC.
 - `ofdm` modulation: BPSK on 3 subcarriers (600/1200/1800 Hz), Goertzel decode, `bit_repeat=3`
   majority-vote FEC. Survives PCoIP OPUS 32–256 kbps and ADPCM compression.
+- `ofdm-hr` modulation: BPSK on 8 subcarriers (600–4800 Hz at 600 Hz spacing), Goertzel decode,
+  Hamming(7,4) FEC (1.75x overhead). ~4x the goodput of `ofdm` (~2.4 kbps) on >=48 kbps OPUS paths;
+  use `ofdm` on degraded (<=32 kbps OPUS) channels. Selected by `auto`.
+- Link-layer payloads are zlib-compressed when beneficial (`DATA_Z` frame type); encoded PCM is
+  cached on the transport and reused across retransmissions to avoid re-encoding cost.
 
 ## Limitations
 
