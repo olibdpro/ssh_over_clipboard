@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import pathlib
 import random
+import shutil
 import struct
+import subprocess
 import sys
 import unittest
 
@@ -11,7 +13,15 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from gitssh.audio_modem import AudioFrameCodec, RobustFskFrameCodec, create_audio_frame_codec
+from gitssh.audio_modem import (
+    AudioFrameCodec,
+    OfdmFrameCodec,
+    OfdmHighRateCodec,
+    RobustFskFrameCodec,
+    create_audio_frame_codec,
+    _hamming74_decode,
+    _hamming74_encode,
+)
 
 
 class AudioFrameCodecTests(unittest.TestCase):
@@ -61,14 +71,18 @@ class AudioFrameCodecTests(unittest.TestCase):
         frames = codec.feed_pcm(noisy_pcm)
         self.assertEqual(frames, [payload])
 
-    def test_create_codec_auto_uses_robust_profile(self) -> None:
+    def test_create_codec_auto_uses_high_rate_ofdm_profile(self) -> None:
+        # 'auto' is the default selector; it now resolves to the high-rate OFDM
+        # profile, tuned for the PCoIP/OPUS audio path this transport targets.
         codec = create_audio_frame_codec(
             modulation="auto",
             sample_rate=48000,
             byte_repeat=3,
             marker_run=16,
         )
-        self.assertIsInstance(codec, RobustFskFrameCodec)
+        self.assertIsInstance(codec, OfdmHighRateCodec)
+        self.assertEqual(codec._n_subcarriers, 8)
+        self.assertEqual(codec.channels, 1)
 
     def test_create_codec_pcoip_safe_uses_resilient_fsk_profile(self) -> None:
         codec = create_audio_frame_codec(
@@ -78,40 +92,417 @@ class AudioFrameCodecTests(unittest.TestCase):
             marker_run=16,
         )
         self.assertIsInstance(codec, RobustFskFrameCodec)
-        self.assertEqual(codec.symbol_rate, 1800)
+        self.assertEqual(codec.symbol_rate, 900)
         self.assertEqual(codec.bit_repeat, 3)
-        self.assertEqual(codec.preamble_pairs, 8)
-        self.assertEqual(codec.start_gate_tail_symbols, 8)
-        self.assertEqual(codec.start_max_errors, 3)
-        self.assertEqual(codec.end_max_errors, 2)
+        self.assertEqual(codec.channels, 1)
+        self.assertEqual(codec._freqs, (600.0, 900.0, 1200.0, 1800.0))
 
-    def test_pcoip_safe_round_trip_frame(self) -> None:
+    def test_pcoip_safe_codec_round_trip_frame(self) -> None:
         codec = create_audio_frame_codec(
             modulation="pcoip-safe",
             sample_rate=48000,
             byte_repeat=3,
             marker_run=16,
         )
-        payload = b"pcoip-safe-roundtrip"
+        payload = b"pcoip-ack-payload"
         pcm = codec.encode_frame(payload)
         frames = codec.feed_pcm(pcm)
         self.assertEqual(frames, [payload])
 
-    def test_pcoip_safe_encoded_frame_is_shorter_than_conservative_profile(self) -> None:
-        payload = b"A" * 320
-        fast = create_audio_frame_codec(
+
+class _CompressionTestHelpers:
+    """Mixin providing ffmpeg-based OPUS and ADPCM round-trip helpers."""
+
+    def _opus_roundtrip(self, pcm: bytes, bitrate_bps: int, channels: int = 1) -> bytes:
+        """Encode s16le 48 kHz → OGG/OPUS → s16le 48 kHz.
+
+        Uses application=audio (CELT mode) to preserve tonal content rather
+        than the voice-optimised SILK mode that PCoIP would likely select for
+        mono microphone audio.
+        """
+        enc = subprocess.run(
+            [
+                "ffmpeg", "-f", "s16le", "-ar", "48000", "-ac", str(channels),
+                "-i", "pipe:0",
+                "-c:a", "libopus", "-b:a", str(bitrate_bps),
+                "-application", "audio",
+                "-f", "ogg", "pipe:1",
+            ],
+            input=pcm,
+            capture_output=True,
+            check=True,
+        )
+        dec = subprocess.run(
+            [
+                "ffmpeg", "-f", "ogg", "-i", "pipe:0",
+                "-f", "s16le", "-ar", "48000", "-ac", str(channels), "pipe:1",
+            ],
+            input=enc.stdout,
+            capture_output=True,
+            check=True,
+        )
+        return dec.stdout
+
+    def _adpcm_roundtrip(
+        self,
+        pcm: bytes,
+        sample_rate: int,
+        adpcm_channels: int,
+        *,
+        pcm_channels: int = 1,
+    ) -> bytes:
+        """Encode s16le 48 kHz → IMA ADPCM WAV → s16le 48 kHz.
+
+        adpcm_channels — number of channels in the compressed ADPCM stream,
+            matching the PCoIP bandwidth tier (2 for ≥2 Mbps, 1 for ≤700 kbps).
+        pcm_channels — number of channels in the input/output PCM, matching the
+            codec.  When adpcm_channels < pcm_channels PCoIP downmixes on encode
+            and upmixes on decode (both L and R become identical after the trip).
+
+        ffmpeg resamples to the target sample_rate before encoding and back to
+        48 kHz after decoding, simulating the PCoIP DSP pipeline.  IMA ADPCM
+        (adpcm_ima_wav) uses 4 bits/sample — matching the PCoIP ADPCM table.
+        """
+        enc = subprocess.run(
+            [
+                "ffmpeg", "-f", "s16le", "-ar", "48000", "-ac", str(pcm_channels),
+                "-i", "pipe:0",
+                "-ar", str(sample_rate), "-ac", str(adpcm_channels),
+                "-c:a", "adpcm_ima_wav",
+                "-f", "wav", "pipe:1",
+            ],
+            input=pcm,
+            capture_output=True,
+            check=True,
+        )
+        dec = subprocess.run(
+            [
+                "ffmpeg", "-i", "pipe:0",
+                "-f", "s16le", "-ar", "48000", "-ac", str(pcm_channels), "pipe:1",
+            ],
+            input=enc.stdout,
+            capture_output=True,
+            check=True,
+        )
+        return dec.stdout
+
+
+@unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not available")
+class PCoIPCompressionSurvivalTests(_CompressionTestHelpers, unittest.TestCase):
+    """Verify the pcoip-safe modem survives PCoIP audio codec compression.
+
+    PCoIP uses two codecs depending on direction and client generation:
+
+    OPUS  (host→client, modern clients — Tera2 FW 5.x, Software Client 1.4+)
+    -----------------------------------------------------------------------
+    Network BW   | Bitrate    | Quality
+    > 10 Mbps    | 256 kbps   | Stereo high-quality
+    125k–10 Mbps | 48–255 kbps| Stereo FM/AM quality
+    ~125 kbps    | 32–47 kbps | Mono phone quality (minimum viable)
+
+    ADPCM  (client→host microphone path; also host→client on legacy clients)
+    -----------------------------------------------------------------------
+    Network BW   | Sample rate | Channels | Codec BW
+    8 Mbps       | 48 kHz      | stereo   | 1500 kbps  (16-bit PCM tier)
+    2 Mbps       | 48 kHz      | stereo   | 400 kbps   (4-bit ADPCM)
+    700 kbps     | 16 kHz      | mono     | 90 kbps
+    125 kbps     | 8 kHz       | mono     | 60 kbps    (minimum viable)
+
+    Each test encodes a frame → compresses through the codec → decompresses →
+    feeds the PCM to a fresh decoder, verifying the frame is recovered.
+    """
+
+    _PAYLOAD = b"pcoip-integration-test-payload"
+
+    def _make_codec(self) -> RobustFskFrameCodec:
+        return create_audio_frame_codec(
             modulation="pcoip-safe",
             sample_rate=48000,
             byte_repeat=3,
             marker_run=16,
         )
-        slow = RobustFskFrameCodec(
-            sample_rate=48000,
-            symbol_rate=900,
-            bit_repeat=5,
-            amplitude=13000,
+
+    # ── OPUS tests ──────────────────────────────────────────────────────────
+
+    def test_pcoip_safe_survives_opus_256kbps(self) -> None:
+        """OPUS 256 kbps — high-quality tier, available on >10 Mbps links."""
+        codec = self._make_codec()
+        pcm = codec.encode_frame(self._PAYLOAD)
+        dec_codec = self._make_codec()
+        frames = dec_codec.feed_pcm(self._opus_roundtrip(pcm, 256_000, channels=codec.channels))
+        self.assertEqual(frames, [self._PAYLOAD])
+
+    def test_pcoip_safe_survives_opus_48kbps(self) -> None:
+        """OPUS 48 kbps — AM-radio quality, typical on 125 kbps–10 Mbps links."""
+        codec = self._make_codec()
+        pcm = codec.encode_frame(self._PAYLOAD)
+        dec_codec = self._make_codec()
+        frames = dec_codec.feed_pcm(self._opus_roundtrip(pcm, 48_000, channels=codec.channels))
+        self.assertEqual(frames, [self._PAYLOAD])
+
+    def test_pcoip_safe_survives_opus_32kbps(self) -> None:
+        """OPUS 32 kbps — phone quality, minimum viable PCoIP audio tier."""
+        codec = self._make_codec()
+        pcm = codec.encode_frame(self._PAYLOAD)
+        dec_codec = self._make_codec()
+        frames = dec_codec.feed_pcm(self._opus_roundtrip(pcm, 32_000, channels=codec.channels))
+        self.assertEqual(frames, [self._PAYLOAD])
+
+    # ── ADPCM tests ─────────────────────────────────────────────────────────
+
+    def test_pcoip_safe_survives_adpcm_48khz_stereo(self) -> None:
+        """ADPCM 48 kHz stereo 4-bit — 2 Mbps network tier (400 kbps audio)."""
+        codec = self._make_codec()
+        pcm = codec.encode_frame(self._PAYLOAD)
+        dec_codec = self._make_codec()
+        frames = dec_codec.feed_pcm(
+            self._adpcm_roundtrip(pcm, 48000, adpcm_channels=codec.channels, pcm_channels=codec.channels)
         )
-        self.assertLess(len(fast.encode_frame(payload)), len(slow.encode_frame(payload)))
+        self.assertEqual(frames, [self._PAYLOAD])
+
+    def test_pcoip_safe_survives_adpcm_16khz_mono(self) -> None:
+        """ADPCM 16 kHz mono 4-bit — 700 kbps network tier (90 kbps audio).
+
+        PCoIP downmixes stereo to mono at this tier; the receive side upmixes
+        back to stereo (L=R), which the stereo decoder can still decode.
+        """
+        codec = self._make_codec()
+        pcm = codec.encode_frame(self._PAYLOAD)
+        dec_codec = self._make_codec()
+        frames = dec_codec.feed_pcm(
+            self._adpcm_roundtrip(pcm, 16000, adpcm_channels=1, pcm_channels=codec.channels)
+        )
+        self.assertEqual(frames, [self._PAYLOAD])
+
+    def test_pcoip_safe_survives_adpcm_8khz_mono(self) -> None:
+        """ADPCM 8 kHz mono 4-bit — 125 kbps network tier (60 kbps audio, minimum viable).
+
+        PCoIP downmixes stereo to mono at this tier; the receive side upmixes
+        back to stereo (L=R), which the stereo decoder can still decode.
+        """
+        codec = self._make_codec()
+        pcm = codec.encode_frame(self._PAYLOAD)
+        dec_codec = self._make_codec()
+        frames = dec_codec.feed_pcm(
+            self._adpcm_roundtrip(pcm, 8000, adpcm_channels=1, pcm_channels=codec.channels)
+        )
+        self.assertEqual(frames, [self._PAYLOAD])
+
+
+class OfdmFrameCodecTests(unittest.TestCase):
+    """Unit tests for the OFDM BPSK frame codec."""
+
+    def test_ofdm_codec_round_trip_frame(self) -> None:
+        codec = OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2)
+        payload = b"ofdm-hello"
+        pcm = codec.encode_frame(payload)
+        dec = OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2)
+        frames = dec.feed_pcm(pcm)
+        self.assertEqual(frames, [payload])
+
+    def test_ofdm_codec_round_trip_larger_payload(self) -> None:
+        """280-byte payload matches connect_req size."""
+        codec = OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2)
+        payload = bytes(range(256)) + bytes(range(24))  # 280 bytes
+        pcm = codec.encode_frame(payload)
+        dec = OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2)
+        frames = dec.feed_pcm(pcm)
+        self.assertEqual(frames, [payload])
+
+    def test_ofdm_round_trip_with_sample_offset(self) -> None:
+        """Decoder receives PCM that starts mid-stream (random byte offset before the frame).
+
+        In real audio the decoder buffer begins at an arbitrary sample offset relative
+        to the transmitted signal.  The 80-offset preamble sweep must recover regardless.
+        """
+        codec = OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2)
+        payload = b"offset-alignment-test"
+        pcm = codec.encode_frame(payload)
+        for offset_samples in (0, 7, 20, 37, 63, 79):
+            with self.subTest(offset_samples=offset_samples):
+                # Prepend `offset_samples` frames of silence to simulate a misaligned start
+                silence = bytes(offset_samples * 2 * codec.channels)  # int16 stereo
+                dec = OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2)
+                frames = dec.feed_pcm(silence + pcm)
+                self.assertEqual(frames, [payload], f"failed at offset_samples={offset_samples}")
+
+    def test_ofdm_round_trip_chunked_feed(self) -> None:
+        """Decoder handles PCM fed in small chunks (simulates streaming audio)."""
+        codec = OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2)
+        payload = b"chunked-feed-test"
+        pcm = codec.encode_frame(payload)
+        dec = OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2)
+        chunk_bytes = 3840  # 20 ms at 48 kHz stereo int16
+        all_frames: list[bytes] = []
+        for i in range(0, len(pcm), chunk_bytes):
+            all_frames.extend(dec.feed_pcm(pcm[i : i + chunk_bytes]))
+        self.assertEqual(all_frames, [payload])
+
+    def test_ofdm_rejects_wrong_sample_rate(self) -> None:
+        from gitssh.audio_modem import AudioCodecError
+        with self.assertRaises(AudioCodecError):
+            OfdmFrameCodec(sample_rate=44100)
+
+    def test_ofdm_symbol_samples(self) -> None:
+        codec = OfdmFrameCodec(sample_rate=48000)
+        self.assertEqual(codec.symbol_samples, 80)
+
+    def test_create_codec_ofdm_profile(self) -> None:
+        codec = create_audio_frame_codec(
+            modulation="ofdm",
+            sample_rate=48000,
+            byte_repeat=3,
+            marker_run=16,
+        )
+        self.assertIsInstance(codec, OfdmFrameCodec)
+        self.assertEqual(codec.channels, 1)
+        self.assertEqual(codec.amplitude, 13000)
+        self.assertEqual(codec.symbol_samples, 80)
+        self.assertEqual(codec.bit_repeat, 3)
+
+
+class OfdmHighRateCodecTests(unittest.TestCase):
+    """Unit tests for the high-rate OFDM codec (8 carriers + Hamming(7,4))."""
+
+    def test_hamming74_corrects_every_single_bit_error(self) -> None:
+        for value in range(16):
+            data = [(value >> bit) & 1 for bit in (3, 2, 1, 0)]
+            codeword = _hamming74_encode(data)
+            self.assertEqual(_hamming74_decode(codeword), data)
+            for flip in range(7):
+                corrupted = codeword[:]
+                corrupted[flip] ^= 1
+                self.assertEqual(
+                    _hamming74_decode(corrupted), data,
+                    f"failed to correct error at position {flip} for data {data}",
+                )
+
+    def test_eight_subcarriers_in_opus_band(self) -> None:
+        codec = OfdmHighRateCodec()
+        self.assertEqual(codec._n_subcarriers, 8)
+        self.assertEqual(codec.channels, 1)
+        self.assertEqual(codec.symbol_samples, 80)
+        # All subcarriers in the 600-4800 Hz band that survives 48 kbps OPUS.
+        self.assertEqual(codec._SUBCARRIER_FREQS[0], 600.0)
+        self.assertEqual(codec._SUBCARRIER_FREQS[-1], 4800.0)
+
+    def test_round_trip_frame(self) -> None:
+        for payload in (b"", b"hr", b"high-rate-ofdm-hello", bytes(range(256))):
+            with self.subTest(n=len(payload)):
+                enc = OfdmHighRateCodec()
+                dec = OfdmHighRateCodec()
+                frames = dec.feed_pcm(enc.encode_frame(payload))
+                self.assertEqual(frames, [payload])
+
+    def test_round_trip_with_sample_offset(self) -> None:
+        enc = OfdmHighRateCodec()
+        payload = b"offset-alignment-hr"
+        pcm = enc.encode_frame(payload)
+        for offset_samples in (0, 7, 37, 79):
+            with self.subTest(offset_samples=offset_samples):
+                silence = bytes(offset_samples * 2 * enc.channels)
+                dec = OfdmHighRateCodec()
+                self.assertEqual(dec.feed_pcm(silence + pcm), [payload])
+
+    def test_round_trip_chunked_feed(self) -> None:
+        enc = OfdmHighRateCodec()
+        payload = b"chunked-feed-hr-test"
+        pcm = enc.encode_frame(payload)
+        dec = OfdmHighRateCodec()
+        all_frames: list[bytes] = []
+        for i in range(0, len(pcm), 1920):  # 20 ms at 48 kHz mono int16
+            all_frames.extend(dec.feed_pcm(pcm[i : i + 1920]))
+        self.assertEqual(all_frames, [payload])
+
+    def test_higher_goodput_than_base_ofdm(self) -> None:
+        payload = bytes(220)
+        base_pcm = OfdmFrameCodec(sample_rate=48000, channels=1, bit_repeat=3).encode_frame(payload)
+        hr_pcm = OfdmHighRateCodec().encode_frame(payload)
+        # ~4x fewer PCM samples for the same payload (3x->1.75x FEC + 3->8 carriers).
+        self.assertLess(len(hr_pcm), len(base_pcm) / 3.0)
+
+    def test_create_codec_ofdm_hr_profile(self) -> None:
+        codec = create_audio_frame_codec(
+            modulation="ofdm-hr",
+            sample_rate=48000,
+            byte_repeat=1,
+            marker_run=16,
+        )
+        self.assertIsInstance(codec, OfdmHighRateCodec)
+        self.assertEqual(codec.channels, 1)
+        self.assertEqual(codec.symbol_samples, 80)
+        self.assertEqual(codec._n_subcarriers, 8)
+
+
+@unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not available")
+class OfdmCompressionSurvivalTests(_CompressionTestHelpers, unittest.TestCase):
+    """Verify the OFDM modem survives PCoIP audio codec compression."""
+
+    _PAYLOAD = b"ofdm-compression-survival-test"
+
+    def _make_codec(self) -> OfdmFrameCodec:
+        return OfdmFrameCodec(sample_rate=48000, amplitude=13000, channels=2, bit_repeat=3)
+
+    def test_ofdm_survives_opus_256kbps(self) -> None:
+        codec = self._make_codec()
+        pcm = codec.encode_frame(self._PAYLOAD)
+        dec = self._make_codec()
+        frames = dec.feed_pcm(self._opus_roundtrip(pcm, 256_000, channels=codec.channels))
+        self.assertEqual(frames, [self._PAYLOAD])
+
+    def test_ofdm_survives_opus_48kbps(self) -> None:
+        codec = self._make_codec()
+        pcm = codec.encode_frame(self._PAYLOAD)
+        dec = self._make_codec()
+        frames = dec.feed_pcm(self._opus_roundtrip(pcm, 48_000, channels=codec.channels))
+        self.assertEqual(frames, [self._PAYLOAD])
+
+    def test_ofdm_survives_opus_32kbps(self) -> None:
+        codec = self._make_codec()
+        pcm = codec.encode_frame(self._PAYLOAD)
+        dec = self._make_codec()
+        frames = dec.feed_pcm(self._opus_roundtrip(pcm, 32_000, channels=codec.channels))
+        self.assertEqual(frames, [self._PAYLOAD])
+
+    def test_ofdm_survives_adpcm_48khz_stereo(self) -> None:
+        codec = self._make_codec()
+        pcm = codec.encode_frame(self._PAYLOAD)
+        dec = self._make_codec()
+        frames = dec.feed_pcm(
+            self._adpcm_roundtrip(pcm, 48000, adpcm_channels=codec.channels, pcm_channels=codec.channels)
+        )
+        self.assertEqual(frames, [self._PAYLOAD])
+
+
+@unittest.skipUnless(shutil.which("ffmpeg"), "ffmpeg not available")
+class OfdmHighRateCompressionSurvivalTests(_CompressionTestHelpers, unittest.TestCase):
+    """Verify the high-rate OFDM modem survives good-quality OPUS tiers.
+
+    The high-rate profile (8 carriers, Hamming(7,4)) is tuned for >= 48 kbps OPUS,
+    which is the modern PCoIP tier.  It deliberately trades the heavily-degraded
+    (<= 32 kbps) robustness of the base 'ofdm' profile for ~4x the goodput, so only
+    the 256 kbps and 48 kbps tiers are asserted here.  Mono matches the codec's
+    PCoIP configuration.
+    """
+
+    _PAYLOAD = b"ofdm-high-rate-compression-survival-payload-0123456789"
+
+    def _make_codec(self) -> OfdmHighRateCodec:
+        return OfdmHighRateCodec(sample_rate=48000, amplitude=16000, channels=1)
+
+    def test_high_rate_survives_opus_256kbps(self) -> None:
+        codec = self._make_codec()
+        pcm = codec.encode_frame(self._PAYLOAD)
+        dec = self._make_codec()
+        frames = dec.feed_pcm(self._opus_roundtrip(pcm, 256_000, channels=codec.channels))
+        self.assertEqual(frames, [self._PAYLOAD])
+
+    def test_high_rate_survives_opus_48kbps(self) -> None:
+        codec = self._make_codec()
+        pcm = codec.encode_frame(self._PAYLOAD)
+        dec = self._make_codec()
+        frames = dec.feed_pcm(self._opus_roundtrip(pcm, 48_000, channels=codec.channels))
+        self.assertEqual(frames, [self._PAYLOAD])
 
 
 if __name__ == "__main__":

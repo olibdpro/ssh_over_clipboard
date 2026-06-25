@@ -772,8 +772,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--audio-modulation",
         default="auto",
-        choices=["auto", "legacy", "robust-v1", "pcoip-safe"],
-        help="Audio modulation profile for --transport audio-modem",
+        choices=["auto", "legacy", "robust-v1", "pcoip-safe", "ofdm", "ofdm-hr"],
+        help="Audio modulation profile for --transport audio-modem; 'auto' (default) "
+        "selects ofdm-hr (high-rate OFDM, ~4x ofdm goodput, for >=48 kbps OPUS paths)",
     )
     parser.add_argument(
         "--shell",

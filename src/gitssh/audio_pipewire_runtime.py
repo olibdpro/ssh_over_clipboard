@@ -653,6 +653,7 @@ class PipeWireLinkAudioDuplexIO:
         capture_node_id: int,
         write_node_id: int,
         sample_rate: int,
+        channels: int = 1,
         read_timeout: float,
         write_timeout: float,
         pw_record_bin: str = "pw-record",
@@ -687,7 +688,7 @@ class PipeWireLinkAudioDuplexIO:
         self._playback_target_id = write_node_id
         self._playback_stream_header = _build_streaming_wav_header(
             sample_rate=sample_rate,
-            channels=1,
+            channels=max(channels, 1),
             bits_per_sample=16,
         )
         self._playback_header_sent = False
@@ -742,7 +743,7 @@ class PipeWireLinkAudioDuplexIO:
             "--rate",
             str(sample_rate),
             "--channels",
-            "1",
+            str(max(channels, 1)),
             "--format",
             "s16",
             "--latency",
@@ -756,7 +757,7 @@ class PipeWireLinkAudioDuplexIO:
             "--rate",
             str(sample_rate),
             "--channels",
-            "1",
+            str(max(channels, 1)),
             "--format",
             "s16",
             "--latency",
@@ -1137,6 +1138,7 @@ class PipeWireLinkAudioDuplexIO:
         setattr(self, attr_name, None)
 
     def _wait_for_process_stability(self) -> None:
+        # Phase 1: short crash-detection window (0.2 s).
         deadline = time.monotonic() + 0.2
         while time.monotonic() < deadline:
             if self._capture.poll() is not None:
@@ -1146,6 +1148,28 @@ class PipeWireLinkAudioDuplexIO:
             if self._capture_tail.poll() is not None:
                 raise PipeWireRuntimeError(_process_stderr(self._capture_tail, "tail capture stream"))
             time.sleep(0.01)
+
+        # Phase 2: wait for both pw-record and pw-play to register their PipeWire
+        # nodes (up to 2 s additional).  On slow systems or when the session manager
+        # is busy, node registration can take several hundred milliseconds; if we
+        # try to set up explicit links before the nodes appear the link fails and we
+        # fall back to --target direct mode, which does NOT route to Stream/Input/Audio
+        # targets (such as the PCoIP virtual microphone) reliably.
+        if self._routing_mode != "explicit_link":
+            return
+        deadline2 = time.monotonic() + 2.0
+        while time.monotonic() < deadline2:
+            self._refresh_dynamic_link_nodes()
+            if (
+                self._capture_link_target_id is not None
+                and self._playback_link_source_id is not None
+            ):
+                return
+            if self._capture.poll() is not None:
+                raise PipeWireRuntimeError(_process_stderr(self._capture, "pw-record capture"))
+            if self._playback.poll() is not None:
+                raise PipeWireRuntimeError(_process_stderr(self._playback, "pw-play playback"))
+            time.sleep(0.05)
 
     def _ensure_links_ready(self) -> None:
         start_idx = len(self._linked_pairs)
@@ -1381,6 +1405,7 @@ class PipeWireWavCaptureAudioDuplexIO(PipeWireLinkAudioDuplexIO):
         capture_wav_path: str,
         write_node_id: int,
         sample_rate: int,
+        channels: int = 1,
         read_timeout: float,
         write_timeout: float,
         pw_play_bin: str = "pw-play",
@@ -1415,7 +1440,7 @@ class PipeWireWavCaptureAudioDuplexIO(PipeWireLinkAudioDuplexIO):
         self._playback_target_id = write_node_id
         self._playback_stream_header = _build_streaming_wav_header(
             sample_rate=sample_rate,
-            channels=1,
+            channels=max(channels, 1),
             bits_per_sample=16,
         )
         self._playback_header_sent = False
@@ -1447,7 +1472,7 @@ class PipeWireWavCaptureAudioDuplexIO(PipeWireLinkAudioDuplexIO):
             "--rate",
             str(sample_rate),
             "--channels",
-            "1",
+            str(max(channels, 1)),
             "--format",
             "s16",
             "--latency",

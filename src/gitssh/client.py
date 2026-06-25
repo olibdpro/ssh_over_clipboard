@@ -703,8 +703,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--audio-modulation",
         default="auto",
-        choices=["auto", "legacy", "robust-v1", "pcoip-safe"],
-        help="Audio modulation profile for --transport audio-modem",
+        choices=["auto", "legacy", "robust-v1", "pcoip-safe", "ofdm", "ofdm-hr"],
+        help="Audio modulation profile for --transport audio-modem; 'auto' (default) "
+        "selects ofdm-hr (high-rate OFDM, ~4x ofdm goodput, for >=48 kbps OPUS paths)",
     )
     parser.add_argument(
         "--poll-interval-ms",
@@ -862,6 +863,7 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
                         capture_wav_path=capture_wav_path,
                         write_node_id=write_node_id,
                         sample_rate=max(config.sample_rate, 8000),
+                        channels=max(config.channels, 1),
                         read_timeout=max(config.read_timeout, 0.0),
                         write_timeout=max(config.write_timeout, 0.001),
                     ),
@@ -876,6 +878,7 @@ def _build_backend(args: argparse.Namespace) -> TransportBackend:
                     capture_node_id=capture_node_id_final,
                     write_node_id=write_node_id,
                     sample_rate=max(config.sample_rate, 8000),
+                    channels=max(config.channels, 1),
                     read_timeout=max(config.read_timeout, 0.0),
                     write_timeout=max(config.write_timeout, 0.001),
                 ),
